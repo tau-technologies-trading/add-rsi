@@ -16,10 +16,10 @@ static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Parser, Debug)]
 #[command(
     about = "Add Wilder RSI columns to Binance Vision CSV files",
-    long_about = "Add Wilder RSI columns to Binance Vision CSV files.\n\nBy default this processes every matching file independently in parallel, overwriting the original CSVs after confirmation. Use --auto to process only files whose first CSV row has exactly --column columns and skip the confirmation prompt. In --auto mode, each file is classified from only its first CSV row; row totals are shown as not counted. Use --carry for exact RSI continuity across month/file boundaries. Use --copy if you want sibling .rsi.csv outputs instead of replacing the originals.",
+    long_about = "Add Wilder RSI columns to Binance Vision CSV files.\n\nBy default this processes every matching file independently in parallel, overwriting the original CSVs after confirmation. Use --auto to skip files that already appear to have appended columns and skip the confirmation prompt. In --auto without --carry, each file is classified from its last CSV row. In --auto with --carry, each file is classified from its first CSV row, and skipped files are not row-counted, scanned, or written. Use --carry for RSI continuity across the selected files. Use --copy if you want sibling .rsi.csv outputs instead of replacing the originals.",
     version,
     disable_version_flag = true,
-    after_help = "Examples:\n  add-rsi -d ../data\n  add-rsi -d ../data --jobs 3\n  add-rsi -d ../data --auto --carry --jobs 5\n  add-rsi -d ../data --all --copy --window 14,64,256\n\nNotes:\n  --jobs is a maximum; the program uses fewer workers if fewer files exist.\n  --auto processes only files whose first CSV row has exactly --column columns. Only the first row is inspected; row totals are shown as not counted.\n  --auto --carry still scans skipped matching files for RSI state so later RSI values stay continuous, but skipped rows are not included in progress totals.\n  --all processes every matching file, including files with more than --column columns. Extra columns are dropped before RSI values are appended.\n  Set ADD_RSI_NO_CONFIRM=1 to skip the confirmation prompt."
+    after_help = "Examples:\n  add-rsi -d ../data\n  add-rsi -d ../data --jobs 3\n  add-rsi -d ../data --auto --carry --jobs 5\n  add-rsi -d ../data --all --copy --window 14,64,256\n\nNotes:\n  --jobs is a maximum; the program uses fewer workers if fewer files exist.\n  --auto without --carry skips files whose last CSV row has more than --column columns.\n  --auto --carry skips files whose first CSV row has more than --column columns. Skipped files are not written, row-counted, or scanned.\n  --all processes every matching file, including files with more than --column columns. Extra columns are dropped before RSI values are appended.\n  Set ADD_RSI_NO_CONFIRM=1 to skip the confirmation prompt."
 )]
 struct Cli {
     /// Directory containing the CSV files to process.
@@ -35,7 +35,7 @@ struct Cli {
     interval: String,
 
     /// Number of leading columns to preserve before appending RSI values.
-    #[arg(short = 'c', long = "column", default_value_t = 12)]
+    #[arg(short = 'c', long = "column", alias = "columns", default_value_t = 12)]
     column: usize,
 
     /// Comma-separated Wilder RSI windows.
@@ -64,7 +64,7 @@ struct Cli {
     #[arg(short = 'j', long = "jobs", default_value_t = 5)]
     jobs: usize,
 
-    /// Automatically process only files whose first row has exactly --column columns and skip confirmation.
+    /// Automatically skip files that already appear to have appended columns and skip confirmation.
     #[arg(short = 'a', long = "auto", conflicts_with = "all")]
     auto: bool,
 
@@ -97,6 +97,12 @@ enum SelectionMode {
     All,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutoInspectMode {
+    FirstRow,
+    LastRow,
+}
+
 #[derive(Clone, Debug)]
 struct InputFile {
     path: PathBuf,
@@ -110,11 +116,16 @@ struct FileInfo {
     row_count: Option<usize>,
     min_columns: Option<usize>,
     max_columns: Option<usize>,
+    auto_processable: Option<bool>,
 }
 
 impl FileInfo {
     fn is_auto_processable(&self, expected_columns: usize) -> bool {
-        self.min_columns == Some(expected_columns) && self.max_columns == Some(expected_columns)
+        self.auto_processable.unwrap_or_else(|| {
+            self.max_columns
+                .map(|max_columns| max_columns <= expected_columns)
+                .unwrap_or(true)
+        })
     }
 
     fn has_extra_columns(&self, expected_columns: usize) -> bool {
@@ -129,6 +140,7 @@ struct FileStats {
     row_count: Option<usize>,
     min_columns: Option<usize>,
     max_columns: Option<usize>,
+    auto_processable: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -356,12 +368,18 @@ fn run(cli: Cli) -> Result<()> {
         SelectionMode::All
     };
     let skip_confirmation = cli.auto || std::env::var("ADD_RSI_NO_CONFIRM").is_ok();
+    let auto_inspect_mode = if cli.carry {
+        AutoInspectMode::FirstRow
+    } else {
+        AutoInspectMode::LastRow
+    };
 
     let file_info = list_directory_and_confirm(
         &cli.dir,
         &files,
         mode,
         selection_mode,
+        auto_inspect_mode,
         cli.column,
         cli.jobs,
         skip_confirmation,
@@ -381,27 +399,28 @@ fn run(cli: Cli) -> Result<()> {
         let scan_total_rows = process_total_rows;
         let parallel_files = parallel_file_count(files_to_process.len(), cli.jobs);
         println!(
-            "\nCarryover mode: scanning {} matching files for exact RSI state, then processing {} in parallel.",
-            file_info.len(),
+            "\nCarryover mode: scanning {} selected file{} for RSI start states, then processing {} in parallel.",
+            files_to_process.len(),
+            if files_to_process.len() == 1 { "" } else { "s" },
             parallel_summary(parallel_files)
         );
+        if selection_mode == SelectionMode::Auto {
+            println!("Carryover mode: skipped --auto files are not scanned.");
+        }
 
         let carry_progress = ProgressUi::new("CARRY ", scan_total_rows.map(|row_count| row_count as u64), 1);
         let start_states = compute_start_states(
-            &file_info,
-            selection_mode,
-            cli.column,
+            &files_to_process,
             &cli.windows,
             &cli.fallback,
             &carry_progress,
         )?;
         carry_progress.finish();
 
-        let process_plan = file_info
+        let process_plan = files_to_process
             .iter()
             .cloned()
             .zip(start_states)
-            .filter(|(file_info, _)| should_process_file(file_info, selection_mode, cli.column))
             .collect::<Vec<_>>();
 
         let process_progress = ProgressUi::new("TOTAL ", process_total_rows.map(|row_count| row_count as u64), parallel_files);
@@ -519,6 +538,7 @@ fn list_directory_and_confirm(
     files: &[InputFile],
     mode: OutputMode,
     selection_mode: SelectionMode,
+    auto_inspect_mode: AutoInspectMode,
     expected_columns: usize,
     jobs: usize,
     skip_confirmation: bool,
@@ -531,9 +551,10 @@ fn list_directory_and_confirm(
 
     println!(
         "\n{} with up to {} in parallel...",
-        match selection_mode {
-            SelectionMode::Auto => "Checking first-row columns",
-            SelectionMode::All => "Counting rows and columns",
+        match (selection_mode, auto_inspect_mode) {
+            (SelectionMode::Auto, AutoInspectMode::FirstRow) => "Checking first-row columns",
+            (SelectionMode::Auto, AutoInspectMode::LastRow) => "Checking last-row columns",
+            (SelectionMode::All, _) => "Counting rows and columns",
         },
         parallel_summary(parallel_files)
     );
@@ -541,13 +562,19 @@ fn list_directory_and_confirm(
         files
             .par_iter()
             .map(|file| {
-                let stats = analyze_file(&file.path, selection_mode, expected_columns)
-                    .with_context(|| format!("failed to inspect {}", file.path.display()))?;
+                let stats = analyze_file(
+                    &file.path,
+                    selection_mode,
+                    auto_inspect_mode,
+                    expected_columns,
+                )
+                .with_context(|| format!("failed to inspect {}", file.path.display()))?;
                 Ok::<_, anyhow::Error>(FileInfo {
                     file: file.clone(),
                     row_count: stats.row_count,
                     min_columns: stats.min_columns,
                     max_columns: stats.max_columns,
+                    auto_processable: stats.auto_processable,
                 })
             })
             .collect::<Result<Vec<_>>>()
@@ -573,7 +600,14 @@ fn list_directory_and_confirm(
     println!(
         "Selection mode: {}",
         match selection_mode {
-            SelectionMode::Auto => "auto: process only files whose first row has the target column count",
+            SelectionMode::Auto => match auto_inspect_mode {
+                AutoInspectMode::FirstRow => {
+                    "auto: skip files whose first row has more than the target column count"
+                }
+                AutoInspectMode::LastRow => {
+                    "auto: skip files whose last row has more than the target column count"
+                }
+            },
             SelectionMode::All => "all: process every matching file",
         }
     );
@@ -588,13 +622,23 @@ fn list_directory_and_confirm(
     if !skipped_files.is_empty() {
         print_file_list("Files skipped by --auto:", &skipped_files);
         if selection_mode == SelectionMode::Auto {
-            println!(
-                "Skipped files are not written. In --carry mode they are still scanned chronologically so later RSI values remain continuous."
-            );
+            match auto_inspect_mode {
+                AutoInspectMode::FirstRow => println!(
+                    "Skipped files are not written, row-counted, or scanned. RSI state carries across selected files only."
+                ),
+                AutoInspectMode::LastRow => {
+                    println!("Skipped files are not written or processed.")
+                }
+            }
         }
     }
 
-    warn_about_extra_columns(&file_info, selection_mode, expected_columns);
+    warn_about_extra_columns(
+        &file_info,
+        selection_mode,
+        auto_inspect_mode,
+        expected_columns,
+    );
     warn_about_missing_months(&file_info);
 
     println!(
@@ -705,36 +749,72 @@ fn describe_column_range(min_columns: Option<usize>, max_columns: Option<usize>)
 fn warn_about_extra_columns(
     file_info: &[FileInfo],
     selection_mode: SelectionMode,
+    auto_inspect_mode: AutoInspectMode,
     expected_columns: usize,
 ) {
-    let extra_count = file_info
-        .iter()
-        .filter(|file_info| file_info.has_extra_columns(expected_columns))
-        .count();
-
-    if extra_count == 0 {
-        return;
-    }
-
     match selection_mode {
-        SelectionMode::Auto => println!(
-            "\nAuto mode: skipped {extra_count} file{} with more than {expected_columns} columns.",
-            if extra_count == 1 { "" } else { "s" }
-        ),
-        SelectionMode::All => println!(
-            "\nWARNING: processing {extra_count} file{} with more than {expected_columns} columns; extra columns will be dropped before RSI values are appended.",
-            if extra_count == 1 { "" } else { "s" }
-        ),
+        SelectionMode::Auto => {
+            let skipped_count = file_info
+                .iter()
+                .filter(|file_info| !file_info.is_auto_processable(expected_columns))
+                .count();
+            let selected_extra_count = file_info
+                .iter()
+                .filter(|file_info| file_info.is_auto_processable(expected_columns))
+                .filter(|file_info| file_info.has_extra_columns(expected_columns))
+                .count();
+
+            if skipped_count > 0 {
+                println!(
+                    "\nAuto mode: skipped {skipped_count} file{} whose {} has more than {expected_columns} columns.",
+                    if skipped_count == 1 { "" } else { "s" },
+                    auto_inspected_row_name(auto_inspect_mode)
+                );
+            }
+
+            if selected_extra_count > 0 {
+                println!(
+                    "\nWARNING: processing {selected_extra_count} selected file{} with rows over {expected_columns} columns; extra columns will be dropped before RSI values are appended.",
+                    if selected_extra_count == 1 { "" } else { "s" }
+                );
+            }
+        }
+        SelectionMode::All => {
+            let extra_count = file_info
+                .iter()
+                .filter(|file_info| file_info.has_extra_columns(expected_columns))
+                .count();
+
+            if extra_count == 0 {
+                return;
+            }
+
+            println!(
+                "\nWARNING: processing {extra_count} file{} with more than {expected_columns} columns; extra columns will be dropped before RSI values are appended.",
+                if extra_count == 1 { "" } else { "s" }
+            );
+        }
+    }
+}
+
+fn auto_inspected_row_name(auto_inspect_mode: AutoInspectMode) -> &'static str {
+    match auto_inspect_mode {
+        AutoInspectMode::FirstRow => "first row",
+        AutoInspectMode::LastRow => "last row",
     }
 }
 
 fn analyze_file(
     path: &Path,
     selection_mode: SelectionMode,
+    auto_inspect_mode: AutoInspectMode,
     expected_columns: usize,
 ) -> Result<FileStats> {
     match selection_mode {
-        SelectionMode::Auto => analyze_file_for_auto(path, expected_columns),
+        SelectionMode::Auto => match auto_inspect_mode {
+            AutoInspectMode::FirstRow => analyze_file_for_auto_first_row(path, expected_columns),
+            AutoInspectMode::LastRow => analyze_file_for_auto_last_row(path, expected_columns),
+        },
         SelectionMode::All => analyze_file_fully(path),
     }
 }
@@ -763,10 +843,11 @@ fn analyze_file_fully(path: &Path) -> Result<FileStats> {
         row_count: Some(row_count),
         min_columns,
         max_columns,
+        auto_processable: None,
     })
 }
 
-fn analyze_file_for_auto(path: &Path, _expected_columns: usize) -> Result<FileStats> {
+fn analyze_file_for_auto_first_row(path: &Path, expected_columns: usize) -> Result<FileStats> {
     let mut reader = ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
@@ -775,9 +856,10 @@ fn analyze_file_for_auto(path: &Path, _expected_columns: usize) -> Result<FileSt
 
     let Some(result) = reader.records().next() else {
         return Ok(FileStats {
-            row_count: None,
+            row_count: Some(0),
             min_columns: None,
             max_columns: None,
+            auto_processable: Some(true),
         });
     };
 
@@ -785,10 +867,67 @@ fn analyze_file_for_auto(path: &Path, _expected_columns: usize) -> Result<FileSt
         .with_context(|| format!("failed to read first CSV record from {}", path.display()))?;
     let columns = record.len();
 
+    if columns > expected_columns {
+        return Ok(FileStats {
+            row_count: None,
+            min_columns: Some(columns),
+            max_columns: Some(columns),
+            auto_processable: Some(false),
+        });
+    }
+
+    let mut row_count = 1_usize;
+    let mut min_columns = Some(columns);
+    let mut max_columns = Some(columns);
+
+    for result in reader.records() {
+        let record = result
+            .with_context(|| format!("failed to read CSV record from {}", path.display()))?;
+        let columns = record.len();
+        row_count += 1;
+        min_columns = Some(min_columns.map_or(columns, |current| current.min(columns)));
+        max_columns = Some(max_columns.map_or(columns, |current| current.max(columns)));
+    }
+
     Ok(FileStats {
-        row_count: None,
-        min_columns: Some(columns),
-        max_columns: Some(columns),
+        row_count: Some(row_count),
+        min_columns,
+        max_columns,
+        auto_processable: Some(true),
+    })
+}
+
+fn analyze_file_for_auto_last_row(path: &Path, expected_columns: usize) -> Result<FileStats> {
+    let mut reader = ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_path(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+
+    let mut row_count = 0_usize;
+    let mut min_columns = None::<usize>;
+    let mut max_columns = None::<usize>;
+    let mut last_columns = None::<usize>;
+
+    for result in reader.records() {
+        let record = result
+            .with_context(|| format!("failed to read CSV record from {}", path.display()))?;
+        let columns = record.len();
+        row_count += 1;
+        min_columns = Some(min_columns.map_or(columns, |current| current.min(columns)));
+        max_columns = Some(max_columns.map_or(columns, |current| current.max(columns)));
+        last_columns = Some(columns);
+    }
+
+    let auto_processable = last_columns
+        .map(|columns| columns <= expected_columns)
+        .unwrap_or(true);
+
+    Ok(FileStats {
+        row_count: Some(row_count),
+        min_columns,
+        max_columns,
+        auto_processable: Some(auto_processable),
     })
 }
 
@@ -911,8 +1050,6 @@ fn parse_input_filename(file_name: &str, prefix: &str, interval: &str) -> Option
 
 fn compute_start_states(
     file_info: &[FileInfo],
-    selection_mode: SelectionMode,
-    expected_columns: usize,
     windows: &[usize],
     fallback: &str,
     progress: &Arc<ProgressUi>,
@@ -931,14 +1068,13 @@ fn compute_start_states(
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("?");
-        let progress_slot = should_process_file(file_info, selection_mode, expected_columns)
-            .then(|| progress.acquire_slot(name, file_info.row_count.map(|row_count| row_count as u64)));
+        let progress_slot = progress.acquire_slot(name, file_info.row_count.map(|row_count| row_count as u64));
         start_states.push(rolling_states.clone());
         scan_close_column_into_states(
             &file_info.file.path,
             &mut rolling_states,
             fallback,
-            progress_slot.as_ref(),
+            Some(&progress_slot),
         )?;
     }
 
@@ -1289,6 +1425,7 @@ mod tests {
             all: false,
             overwrite: true,
             copy: false,
+            version_flag: false,
         })
         .expect("run overwrite mode");
 
@@ -1330,6 +1467,7 @@ mod tests {
             all: false,
             overwrite: false,
             copy: true,
+            version_flag: false,
         })
         .expect("run copy mode");
 
@@ -1366,6 +1504,7 @@ mod tests {
             all: false,
             overwrite: true,
             copy: false,
+            version_flag: false,
         })
         .expect("run across files");
 
@@ -1377,7 +1516,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_analysis_reads_only_first_row_and_does_not_pre_count_rows() {
+    fn auto_carry_analysis_uses_first_row_and_counts_selected_files() {
         let test_dir = TestDir::new();
         let file_path = test_dir.path.join("SOLUSDT-1s-2024-01.csv");
 
@@ -1389,15 +1528,16 @@ mod tests {
             ],
         );
 
-        let stats = analyze_file_for_auto(&file_path, 12).expect("analyze file");
+        let stats = analyze_file_for_auto_first_row(&file_path, 12).expect("analyze file");
 
-        assert_eq!(stats.row_count, None);
+        assert_eq!(stats.row_count, Some(2));
         assert_eq!(stats.min_columns, Some(12));
-        assert_eq!(stats.max_columns, Some(12));
+        assert_eq!(stats.max_columns, Some(14));
+        assert_eq!(stats.auto_processable, Some(true));
     }
 
     #[test]
-    fn auto_analysis_uses_first_row_to_mark_overwide_files() {
+    fn auto_carry_analysis_skips_from_first_row_without_counting_rows() {
         let test_dir = TestDir::new();
         let file_path = test_dir.path.join("SOLUSDT-1s-2024-01.csv");
 
@@ -1409,7 +1549,7 @@ mod tests {
             ],
         );
 
-        let stats = analyze_file_for_auto(&file_path, 12).expect("analyze file");
+        let stats = analyze_file_for_auto_first_row(&file_path, 12).expect("analyze file");
         let file_info = FileInfo {
             file: InputFile {
                 path: file_path,
@@ -1419,16 +1559,109 @@ mod tests {
             row_count: stats.row_count,
             min_columns: stats.min_columns,
             max_columns: stats.max_columns,
+            auto_processable: stats.auto_processable,
         };
 
         assert_eq!(stats.row_count, None);
         assert_eq!(stats.min_columns, Some(14));
         assert_eq!(stats.max_columns, Some(14));
+        assert_eq!(stats.auto_processable, Some(false));
         assert!(!file_info.is_auto_processable(12));
     }
 
     #[test]
-    fn auto_carry_skips_overwide_files_but_scans_them_for_state() {
+    fn auto_no_carry_analysis_uses_last_row_to_accept_files() {
+        let test_dir = TestDir::new();
+        let file_path = test_dir.path.join("SOLUSDT-1s-2024-01.csv");
+
+        write_rows(
+            &file_path,
+            &[
+                kline_row("10", &["old-rsi-a", "old-rsi-b"]),
+                kline_row("11", &[]),
+            ],
+        );
+
+        let stats = analyze_file_for_auto_last_row(&file_path, 12).expect("analyze file");
+
+        assert_eq!(stats.row_count, Some(2));
+        assert_eq!(stats.min_columns, Some(12));
+        assert_eq!(stats.max_columns, Some(14));
+        assert_eq!(stats.auto_processable, Some(true));
+    }
+
+    #[test]
+    fn auto_no_carry_analysis_uses_last_row_to_skip_files() {
+        let test_dir = TestDir::new();
+        let file_path = test_dir.path.join("SOLUSDT-1s-2024-01.csv");
+
+        write_rows(
+            &file_path,
+            &[
+                kline_row("10", &[]),
+                kline_row("11", &["old-rsi-a", "old-rsi-b"]),
+            ],
+        );
+
+        let stats = analyze_file_for_auto_last_row(&file_path, 12).expect("analyze file");
+
+        assert_eq!(stats.row_count, Some(2));
+        assert_eq!(stats.min_columns, Some(12));
+        assert_eq!(stats.max_columns, Some(14));
+        assert_eq!(stats.auto_processable, Some(false));
+    }
+
+    #[test]
+    fn auto_no_carry_uses_last_row_for_skip_decision() {
+        let test_dir = TestDir::new();
+        let january = test_dir.path.join("SOLUSDT-1s-2024-01.csv");
+        let february = test_dir.path.join("SOLUSDT-1s-2024-02.csv");
+
+        write_rows(
+            &january,
+            &[
+                kline_row("10", &["old-rsi-a", "old-rsi-b"]),
+                kline_row("11", &[]),
+            ],
+        );
+        write_rows(
+            &february,
+            &[
+                kline_row("10", &[]),
+                kline_row("11", &["old-rsi-a", "old-rsi-b"]),
+            ],
+        );
+
+        run(Cli {
+            dir: test_dir.path.clone(),
+            name: "SOLUSDT".to_owned(),
+            interval: "1s".to_owned(),
+            column: 12,
+            windows: vec![1],
+            fallback: "NA".to_owned(),
+            no_carry: false,
+            carry: false,
+            jobs: 5,
+            auto: true,
+            all: false,
+            overwrite: true,
+            copy: false,
+            version_flag: false,
+        })
+        .expect("run auto no-carry mode");
+
+        let january_rows = read_rows(&january);
+        let february_rows = read_rows(&february);
+
+        assert_eq!(january_rows[0].len(), 13);
+        assert!(!january_rows[0].contains(&"old-rsi-a".to_owned()));
+        assert_eq!(february_rows[0].len(), 12);
+        assert_eq!(february_rows[1].len(), 14);
+        assert!(february_rows[1].contains(&"old-rsi-a".to_owned()));
+    }
+
+    #[test]
+    fn auto_carry_skips_overwide_files_and_carries_only_selected_files() {
         let test_dir = TestDir::new();
         let january = test_dir.path.join("SOLUSDT-1s-2024-01.csv");
         let february = test_dir.path.join("SOLUSDT-1s-2024-02.csv");
@@ -1458,6 +1691,7 @@ mod tests {
             all: false,
             overwrite: true,
             copy: false,
+            version_flag: false,
         })
         .expect("run auto carry mode");
 
@@ -1469,10 +1703,10 @@ mod tests {
         assert_eq!(february_rows[0].len(), 14);
         assert!(february_rows[0].contains(&"old-rsi-a".to_owned()));
         assert_eq!(march_rows[0].len(), 13);
-        assert_eq!(march_rows[0][12].parse::<f64>().unwrap(), 50.0);
+        assert_eq!(march_rows[0][12].parse::<f64>().unwrap(), 100.0);
 
         let second_march_value = march_rows[1][12].parse::<f64>().unwrap();
-        assert!((second_march_value - 80.76923076923077).abs() < 1e-12);
+        assert_eq!(second_march_value, 100.0);
     }
 
     #[test]
@@ -1503,6 +1737,7 @@ mod tests {
             all: false,
             overwrite: true,
             copy: false,
+            version_flag: false,
         })
         .expect("run with fallback");
 
