@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -16,10 +16,10 @@ static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Parser, Debug)]
 #[command(
     about = "Add Wilder RSI columns to Binance Vision CSV files",
-    long_about = "Add Wilder RSI columns to Binance Vision CSV files.\n\nBy default this processes files independently in parallel, overwriting the original CSVs after confirmation. Use --carry for exact RSI continuity across month/file boundaries. Use --copy if you want sibling .rsi.csv outputs instead of replacing the originals.",
+    long_about = "Add Wilder RSI columns to Binance Vision CSV files.\n\nBy default this processes every matching file independently in parallel, overwriting the original CSVs after confirmation. Use --auto to process only files whose first CSV row has exactly --column columns and skip the confirmation prompt. In --auto mode, each file is classified from only its first CSV row; row totals are shown as not counted. Use --carry for exact RSI continuity across month/file boundaries. Use --copy if you want sibling .rsi.csv outputs instead of replacing the originals.",
     version,
     disable_version_flag = true,
-    after_help = "Examples:\n  add-rsi -d ../data\n  add-rsi -d ../data --jobs 3\n  add-rsi -d ../data --carry --jobs 5\n  add-rsi -d ../data --copy --window 14,64,256\n\nNotes:\n  --jobs is a maximum; the program uses fewer workers if fewer files exist.\n  --carry does a carry-state pre-pass, then processes files in parallel.\n  Set ADD_RSI_NO_CONFIRM=1 to skip the confirmation prompt."
+    after_help = "Examples:\n  add-rsi -d ../data\n  add-rsi -d ../data --jobs 3\n  add-rsi -d ../data --auto --carry --jobs 5\n  add-rsi -d ../data --all --copy --window 14,64,256\n\nNotes:\n  --jobs is a maximum; the program uses fewer workers if fewer files exist.\n  --auto processes only files whose first CSV row has exactly --column columns. Only the first row is inspected; row totals are shown as not counted.\n  --auto --carry still scans skipped matching files for RSI state so later RSI values stay continuous, but skipped rows are not included in progress totals.\n  --all processes every matching file, including files with more than --column columns. Extra columns are dropped before RSI values are appended.\n  Set ADD_RSI_NO_CONFIRM=1 to skip the confirmation prompt."
 )]
 struct Cli {
     /// Directory containing the CSV files to process.
@@ -60,9 +60,17 @@ struct Cli {
     #[arg(long = "carry", conflicts_with = "no_carry")]
     carry: bool,
 
-    /// Maximum number of files to process in parallel during row counting and output processing.
+    /// Maximum number of files to process in parallel during inspection and output processing.
     #[arg(short = 'j', long = "jobs", default_value_t = 5)]
     jobs: usize,
+
+    /// Automatically process only files whose first row has exactly --column columns and skip confirmation.
+    #[arg(short = 'a', long = "auto", conflicts_with = "all")]
+    auto: bool,
+
+    /// Process every matching file, including files with more than --column columns.
+    #[arg(long = "all", conflicts_with = "auto")]
+    all: bool,
 
     /// Explicitly overwrite the original files in place.
     #[arg(short = 'o', long = "overwrite", conflicts_with = "copy")]
@@ -73,7 +81,7 @@ struct Cli {
     copy: bool,
 
     /// Print version information and exit.
-    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::SetTrue, required = false)]
     version_flag: bool,
 }
 
@@ -83,11 +91,44 @@ enum OutputMode {
     Copy,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectionMode {
+    Auto,
+    All,
+}
+
 #[derive(Clone, Debug)]
 struct InputFile {
     path: PathBuf,
     year: u32,
     month: u32,
+}
+
+#[derive(Clone, Debug)]
+struct FileInfo {
+    file: InputFile,
+    row_count: Option<usize>,
+    min_columns: Option<usize>,
+    max_columns: Option<usize>,
+}
+
+impl FileInfo {
+    fn is_auto_processable(&self, expected_columns: usize) -> bool {
+        self.min_columns == Some(expected_columns) && self.max_columns == Some(expected_columns)
+    }
+
+    fn has_extra_columns(&self, expected_columns: usize) -> bool {
+        self.max_columns
+            .map(|max_columns| max_columns > expected_columns)
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileStats {
+    row_count: Option<usize>,
+    min_columns: Option<usize>,
+    max_columns: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -162,7 +203,6 @@ impl RsiState {
 struct ProgressUi {
     multi: MultiProgress,
     total_bar: ProgressBar,
-    file_style: ProgressStyle,
 }
 
 struct ProgressSlot {
@@ -172,36 +212,26 @@ struct ProgressSlot {
 }
 
 impl ProgressUi {
-    fn new(stage: impl Into<String>, total_rows: u64, parallel_files: usize) -> Arc<Self> {
+    fn new(stage: impl Into<String>, total_rows: Option<u64>, parallel_files: usize) -> Arc<Self> {
         let multi = MultiProgress::new();
 
-        let total_bar = multi.add(ProgressBar::new(total_rows));
+        let total_bar = match total_rows {
+            Some(total_rows) => multi.add(ProgressBar::new(total_rows)),
+            None => multi.add(ProgressBar::new_spinner()),
+        };
         total_bar.set_prefix(stage.into());
         total_bar.set_message(parallel_summary(parallel_files));
-        total_bar.set_style(
-            ProgressStyle::with_template(
-                "{prefix:<7} [{elapsed_precise}] [{bar:40.cyan/blue}] {percent:>3}% {pos}/{len} rows ({per_sec}, ETA {eta}) {msg}",
-            )
-            .expect("valid total progress-bar template")
-            .progress_chars("##-"),
-        );
+        total_bar.set_style(total_progress_style(total_rows.is_some()));
 
-        let file_style = ProgressStyle::with_template(
-            "  {msg:<34} [{bar:28.green/black}] {percent:>3}% {pos}/{len}",
-        )
-        .expect("valid file progress-bar template")
-        .progress_chars("##-");
-
-        Arc::new(Self {
-            multi,
-            total_bar,
-            file_style,
-        })
+        Arc::new(Self { multi, total_bar })
     }
 
-    fn acquire_slot(self: &Arc<Self>, name: &str, total: u64) -> ProgressSlot {
-        let file_bar = self.multi.add(ProgressBar::new(total));
-        file_bar.set_style(self.file_style.clone());
+    fn acquire_slot(self: &Arc<Self>, name: &str, total_rows: Option<u64>) -> ProgressSlot {
+        let file_bar = match total_rows {
+            Some(total_rows) => self.multi.add(ProgressBar::new(total_rows)),
+            None => self.multi.add(ProgressBar::new_spinner()),
+        };
+        file_bar.set_style(file_progress_style(total_rows.is_some()));
         file_bar.set_message(truncate_progress_name(name));
 
         ProgressSlot {
@@ -214,6 +244,34 @@ impl ProgressUi {
     fn finish(&self) {
         self.total_bar.finish_and_clear();
     }
+}
+
+fn total_progress_style(has_total: bool) -> ProgressStyle {
+    if has_total {
+        return ProgressStyle::with_template(
+            "{prefix:<7} [{elapsed_precise}] [{bar:40.cyan/blue}] {percent:>3}% {pos}/{len} rows ({per_sec}, ETA {eta}) {msg}",
+        )
+        .expect("valid total progress-bar template")
+        .progress_chars("##-");
+    }
+
+    ProgressStyle::with_template(
+        "{prefix:<7} [{elapsed_precise}] {spinner:.green} {pos} rows ({per_sec}) {msg}",
+    )
+    .expect("valid total spinner template")
+}
+
+fn file_progress_style(has_total: bool) -> ProgressStyle {
+    if has_total {
+        return ProgressStyle::with_template(
+            "  {msg:<34} [{bar:28.green/black}] {percent:>3}% {pos}/{len}",
+        )
+        .expect("valid file progress-bar template")
+        .progress_chars("##-");
+    }
+
+    ProgressStyle::with_template("  {msg:<34} {spinner:.green} {pos} rows")
+        .expect("valid file spinner template")
 }
 
 impl ProgressSlot {
@@ -249,13 +307,29 @@ fn truncate_progress_name(file_name: &str) -> String {
     shortened
 }
 fn main() {
+    if std::env::args_os()
+        .skip(1)
+        .any(|arg| arg == "-v" || arg == "--version")
+    {
+        print_version();
+        return;
+    }
+
     if let Err(error) = run(Cli::parse()) {
         eprintln!("{error:#}");
         std::process::exit(1);
     }
 }
 
+fn print_version() {
+    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+}
+
 fn run(cli: Cli) -> Result<()> {
+    let _ = cli.version_flag;
+    let _ = cli.no_carry;
+    let _ = cli.all;
+
     if !cli.dir.is_dir() {
         bail!("{} is not a directory", cli.dir.display());
     }
@@ -276,22 +350,61 @@ fn run(cli: Cli) -> Result<()> {
         (_, true) => OutputMode::Copy,
         _ => OutputMode::Overwrite,
     };
+    let selection_mode = if cli.auto {
+        SelectionMode::Auto
+    } else {
+        SelectionMode::All
+    };
+    let skip_confirmation = cli.auto || std::env::var("ADD_RSI_NO_CONFIRM").is_ok();
 
-    let file_info = list_directory_and_confirm(&cli.dir, &files, mode, cli.jobs)?;
-    let total_rows: usize = file_info.iter().map(|(_, row_count)| *row_count).sum();
+    let file_info = list_directory_and_confirm(
+        &cli.dir,
+        &files,
+        mode,
+        selection_mode,
+        cli.column,
+        cli.jobs,
+        skip_confirmation,
+    )?;
+    let files_to_process = select_process_files(&file_info, selection_mode, cli.column);
+
+    if files_to_process.is_empty() {
+        bail!(
+            "no files eligible for processing with --auto and --column {}; use --all to process every matching file",
+            cli.column
+        );
+    }
+
+    let process_total_rows = sum_counted_rows(&files_to_process);
 
     if cli.carry {
-        let parallel_files = parallel_file_count(file_info.len(), cli.jobs);
+        let scan_total_rows = process_total_rows;
+        let parallel_files = parallel_file_count(files_to_process.len(), cli.jobs);
         println!(
-            "\nCarryover mode: computing exact per-file RSI start states, then processing {} in parallel.",
+            "\nCarryover mode: scanning {} matching files for exact RSI state, then processing {} in parallel.",
+            file_info.len(),
             parallel_summary(parallel_files)
         );
 
-        let carry_progress = ProgressUi::new("CARRY ", total_rows as u64, 1);
-        let start_states = compute_start_states(&file_info, &cli.windows, &cli.fallback, &carry_progress)?;
+        let carry_progress = ProgressUi::new("CARRY ", scan_total_rows.map(|row_count| row_count as u64), 1);
+        let start_states = compute_start_states(
+            &file_info,
+            selection_mode,
+            cli.column,
+            &cli.windows,
+            &cli.fallback,
+            &carry_progress,
+        )?;
         carry_progress.finish();
 
-        let process_progress = ProgressUi::new("TOTAL ", total_rows as u64, parallel_files);
+        let process_plan = file_info
+            .iter()
+            .cloned()
+            .zip(start_states)
+            .filter(|(file_info, _)| should_process_file(file_info, selection_mode, cli.column))
+            .collect::<Vec<_>>();
+
+        let process_progress = ProgressUi::new("TOTAL ", process_total_rows.map(|row_count| row_count as u64), parallel_files);
         let fallback = cli.fallback.clone();
         let column = cli.column;
 
@@ -301,19 +414,19 @@ fn run(cli: Cli) -> Result<()> {
             .context("failed to build Rayon thread pool")?;
 
         let result = pool.install(|| {
-            file_info
-                .par_iter()
-                .zip(start_states.into_par_iter())
-                .try_for_each(|((file, row_count), mut states)| {
-                    let name = file
+            process_plan
+                .into_par_iter()
+                .try_for_each(|(file_info, mut states)| {
+                    let name = file_info
+                        .file
                         .path
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("?");
-                    let slot = process_progress.acquire_slot(name, *row_count as u64);
+                    let slot = process_progress.acquire_slot(name, file_info.row_count.map(|row_count| row_count as u64));
 
                     process_file(
-                        &file.path,
+                        &file_info.file.path,
                         column,
                         &fallback,
                         &mut states,
@@ -326,13 +439,13 @@ fn run(cli: Cli) -> Result<()> {
         process_progress.finish();
         result?;
     } else {
-        let parallel_files = parallel_file_count(file_info.len(), cli.jobs);
+        let parallel_files = parallel_file_count(files_to_process.len(), cli.jobs);
         println!(
             "\nNo-carry mode: processing {} in parallel.",
             parallel_summary(parallel_files)
         );
 
-        let process_progress = ProgressUi::new("TOTAL ", total_rows as u64, parallel_files);
+        let process_progress = ProgressUi::new("TOTAL ", process_total_rows.map(|row_count| row_count as u64), parallel_files);
         let windows = cli.windows.clone();
         let fallback = cli.fallback.clone();
         let column = cli.column;
@@ -343,15 +456,16 @@ fn run(cli: Cli) -> Result<()> {
             .context("failed to build Rayon thread pool")?;
 
         let result = pool.install(|| {
-            file_info
-                .par_iter()
-                .try_for_each(|(file, row_count)| {
-                    let name = file
+            files_to_process
+                .into_par_iter()
+                .try_for_each(|file_info| {
+                    let name = file_info
+                        .file
                         .path
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("?");
-                    let slot = process_progress.acquire_slot(name, *row_count as u64);
+                    let slot = process_progress.acquire_slot(name, file_info.row_count.map(|row_count| row_count as u64));
                     let mut states = windows
                         .iter()
                         .copied()
@@ -359,7 +473,7 @@ fn run(cli: Cli) -> Result<()> {
                         .collect::<Vec<_>>();
 
                     process_file(
-                        &file.path,
+                        &file_info.file.path,
                         column,
                         &fallback,
                         &mut states,
@@ -373,14 +487,18 @@ fn run(cli: Cli) -> Result<()> {
         result?;
     }
 
-    println!(
-        "Progress: 100.00% ({}/{})",
-        format_with_commas(total_rows),
-        format_with_commas(total_rows)
-    );
+    match process_total_rows {
+        Some(process_total_rows) => println!(
+            "Progress: 100.00% ({}/{})",
+            format_with_commas(process_total_rows),
+            format_with_commas(process_total_rows)
+        ),
+        None => println!("Progress: completed (rows not counted)."),
+    }
 
     Ok(())
 }
+
 
 
 
@@ -400,49 +518,85 @@ fn list_directory_and_confirm(
     dir: &Path,
     files: &[InputFile],
     mode: OutputMode,
+    selection_mode: SelectionMode,
+    expected_columns: usize,
     jobs: usize,
-) -> Result<Vec<(InputFile, usize)>> {
+    skip_confirmation: bool,
+) -> Result<Vec<FileInfo>> {
     let parallel_files = parallel_file_count(files.len(), jobs);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(parallel_files)
         .build()
-        .context("failed to build Rayon row-counting thread pool")?;
+        .context("failed to build Rayon inspection thread pool")?;
 
-    println!("\nCounting rows with {}...", parallel_summary(parallel_files));
+    println!(
+        "\n{} with up to {} in parallel...",
+        match selection_mode {
+            SelectionMode::Auto => "Checking first-row columns",
+            SelectionMode::All => "Counting rows and columns",
+        },
+        parallel_summary(parallel_files)
+    );
     let file_info = pool.install(|| {
         files
             .par_iter()
             .map(|file| {
-                let row_count = count_rows(&file.path)
-                    .with_context(|| format!("failed to count rows in {}", file.path.display()))?;
-                Ok::<_, anyhow::Error>((file.clone(), row_count))
+                let stats = analyze_file(&file.path, selection_mode, expected_columns)
+                    .with_context(|| format!("failed to inspect {}", file.path.display()))?;
+                Ok::<_, anyhow::Error>(FileInfo {
+                    file: file.clone(),
+                    row_count: stats.row_count,
+                    min_columns: stats.min_columns,
+                    max_columns: stats.max_columns,
+                })
             })
             .collect::<Result<Vec<_>>>()
     })?;
 
     let total_files = file_info.len();
-    let total_rows: usize = file_info.iter().map(|(_, row_count)| *row_count).sum();
+    let total_rows = sum_counted_rows(&file_info);
+    let process_files = select_process_files(&file_info, selection_mode, expected_columns);
+    let process_rows = sum_counted_rows(&process_files);
+    let skipped_files = file_info
+        .iter()
+        .filter(|file_info| !should_process_file(file_info, selection_mode, expected_columns))
+        .cloned()
+        .collect::<Vec<_>>();
 
     println!("\nDirectory: {}", dir.display());
     println!(
-        "Total: {} files, {} rows",
+        "Matching files: {} files, {}",
         total_files,
-        format_with_commas(total_rows)
+        describe_total_rows(total_rows)
     );
-    println!("Files to process:");
-    for (index, (file, row_count)) in file_info.iter().enumerate() {
-        let file_name = file
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?");
-        println!(
-            "  {}. {} ({} rows)",
-            index + 1,
-            file_name,
-            format_with_commas(*row_count)
-        );
+    println!("Column target: {expected_columns}");
+    println!(
+        "Selection mode: {}",
+        match selection_mode {
+            SelectionMode::Auto => "auto: process only files whose first row has the target column count",
+            SelectionMode::All => "all: process every matching file",
+        }
+    );
+    println!(
+        "Files to process: {} files, {}",
+        process_files.len(),
+        describe_total_rows(process_rows)
+    );
+
+    print_file_list("Files to process:", &process_files);
+
+    if !skipped_files.is_empty() {
+        print_file_list("Files skipped by --auto:", &skipped_files);
+        if selection_mode == SelectionMode::Auto {
+            println!(
+                "Skipped files are not written. In --carry mode they are still scanned chronologically so later RSI values remain continuous."
+            );
+        }
     }
+
+    warn_about_extra_columns(&file_info, selection_mode, expected_columns);
+    warn_about_missing_months(&file_info);
+
     println!(
         "Output mode: {}",
         match mode {
@@ -451,7 +605,7 @@ fn list_directory_and_confirm(
         }
     );
 
-    if cfg!(test) || std::env::var("ADD_RSI_NO_CONFIRM").is_ok() {
+    if cfg!(test) || skip_confirmation {
         return Ok(file_info);
     }
 
@@ -469,26 +623,226 @@ fn list_directory_and_confirm(
     Ok(file_info)
 }
 
-fn count_rows(path: &Path) -> Result<usize> {
-    let file = fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut reader = BufReader::with_capacity(1024 * 1024, file);
-    let mut buffer = Vec::with_capacity(64 * 1024);
-    let mut rows = 0_usize;
+fn sum_counted_rows(file_info: &[FileInfo]) -> Option<usize> {
+    let mut total = 0_usize;
 
-    loop {
-        buffer.clear();
-        let bytes_read = reader
-            .read_until(b'\n', &mut buffer)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-
-        if bytes_read == 0 {
-            break;
-        }
-
-        rows += 1;
+    for file_info in file_info {
+        total += file_info.row_count?;
     }
 
-    Ok(rows)
+    Some(total)
+}
+
+fn describe_total_rows(row_count: Option<usize>) -> String {
+    row_count
+        .map(|row_count| format!("{} counted rows", format_with_commas(row_count)))
+        .unwrap_or_else(|| "rows not counted".to_owned())
+}
+
+fn select_process_files(
+    file_info: &[FileInfo],
+    selection_mode: SelectionMode,
+    expected_columns: usize,
+) -> Vec<FileInfo> {
+    file_info
+        .iter()
+        .filter(|file_info| should_process_file(file_info, selection_mode, expected_columns))
+        .cloned()
+        .collect()
+}
+
+fn should_process_file(
+    file_info: &FileInfo,
+    selection_mode: SelectionMode,
+    expected_columns: usize,
+) -> bool {
+    match selection_mode {
+        SelectionMode::Auto => file_info.is_auto_processable(expected_columns),
+        SelectionMode::All => true,
+    }
+}
+
+fn print_file_list(title: &str, file_info: &[FileInfo]) {
+    if file_info.is_empty() {
+        println!("{title} none");
+        return;
+    }
+
+    println!("{title}");
+    for (index, file_info) in file_info.iter().enumerate() {
+        let file_name = file_info
+            .file
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?");
+        println!(
+            "  {}. {} ({} rows, {})",
+            index + 1,
+            file_name,
+            describe_row_count(file_info.row_count),
+            describe_column_range(file_info.min_columns, file_info.max_columns)
+        );
+    }
+}
+
+fn describe_row_count(row_count: Option<usize>) -> String {
+    row_count
+        .map(format_with_commas)
+        .unwrap_or_else(|| "not counted".to_owned())
+}
+
+fn describe_column_range(min_columns: Option<usize>, max_columns: Option<usize>) -> String {
+    match (min_columns, max_columns) {
+        (Some(min_columns), Some(max_columns)) if min_columns == max_columns => {
+            format!("{min_columns} columns")
+        }
+        (Some(min_columns), Some(max_columns)) => format!("{min_columns}-{max_columns} columns"),
+        _ => "no CSV rows".to_owned(),
+    }
+}
+
+fn warn_about_extra_columns(
+    file_info: &[FileInfo],
+    selection_mode: SelectionMode,
+    expected_columns: usize,
+) {
+    let extra_count = file_info
+        .iter()
+        .filter(|file_info| file_info.has_extra_columns(expected_columns))
+        .count();
+
+    if extra_count == 0 {
+        return;
+    }
+
+    match selection_mode {
+        SelectionMode::Auto => println!(
+            "\nAuto mode: skipped {extra_count} file{} with more than {expected_columns} columns.",
+            if extra_count == 1 { "" } else { "s" }
+        ),
+        SelectionMode::All => println!(
+            "\nWARNING: processing {extra_count} file{} with more than {expected_columns} columns; extra columns will be dropped before RSI values are appended.",
+            if extra_count == 1 { "" } else { "s" }
+        ),
+    }
+}
+
+fn analyze_file(
+    path: &Path,
+    selection_mode: SelectionMode,
+    expected_columns: usize,
+) -> Result<FileStats> {
+    match selection_mode {
+        SelectionMode::Auto => analyze_file_for_auto(path, expected_columns),
+        SelectionMode::All => analyze_file_fully(path),
+    }
+}
+
+fn analyze_file_fully(path: &Path) -> Result<FileStats> {
+    let mut reader = ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_path(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+
+    let mut row_count = 0_usize;
+    let mut min_columns = None::<usize>;
+    let mut max_columns = None::<usize>;
+
+    for result in reader.records() {
+        let record = result
+            .with_context(|| format!("failed to read CSV record from {}", path.display()))?;
+        let columns = record.len();
+        row_count += 1;
+        min_columns = Some(min_columns.map_or(columns, |current| current.min(columns)));
+        max_columns = Some(max_columns.map_or(columns, |current| current.max(columns)));
+    }
+
+    Ok(FileStats {
+        row_count: Some(row_count),
+        min_columns,
+        max_columns,
+    })
+}
+
+fn analyze_file_for_auto(path: &Path, _expected_columns: usize) -> Result<FileStats> {
+    let mut reader = ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_path(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+
+    let Some(result) = reader.records().next() else {
+        return Ok(FileStats {
+            row_count: None,
+            min_columns: None,
+            max_columns: None,
+        });
+    };
+
+    let record = result
+        .with_context(|| format!("failed to read first CSV record from {}", path.display()))?;
+    let columns = record.len();
+
+    Ok(FileStats {
+        row_count: None,
+        min_columns: Some(columns),
+        max_columns: Some(columns),
+    })
+}
+
+fn warn_about_missing_months(file_info: &[FileInfo]) {
+    let missing_months = find_missing_months(file_info);
+    if missing_months.is_empty() {
+        return;
+    }
+
+    println!(
+        "\nWARNING: missing {} month{} between first and last file: {}",
+        missing_months.len(),
+        if missing_months.len() == 1 { "" } else { "s" },
+        missing_months.join(", ")
+    );
+    println!(
+        "         Carryover will continue across the gap, but the missing month data is not being processed."
+    );
+}
+
+fn find_missing_months(file_info: &[FileInfo]) -> Vec<String> {
+    let Some(first_file) = file_info.first() else {
+        return Vec::new();
+    };
+    let Some(last_file) = file_info.last() else {
+        return Vec::new();
+    };
+
+    let present_months = file_info
+        .iter()
+        .map(|file_info| month_index(file_info.file.year, file_info.file.month))
+        .collect::<std::collections::HashSet<_>>();
+
+    let start = month_index(first_file.file.year, first_file.file.month);
+    let end = month_index(last_file.file.year, last_file.file.month);
+    let mut missing = Vec::new();
+
+    for month in start..=end {
+        if !present_months.contains(&month) {
+            missing.push(format_month_index(month));
+        }
+    }
+
+    missing
+}
+
+fn month_index(year: u32, month: u32) -> u32 {
+    (year * 12) + (month - 1)
+}
+
+fn format_month_index(month_index: u32) -> String {
+    let year = month_index / 12;
+    let month = (month_index % 12) + 1;
+    format!("{year}-{month:02}")
 }
 
 
@@ -556,7 +910,9 @@ fn parse_input_filename(file_name: &str, prefix: &str, interval: &str) -> Option
 }
 
 fn compute_start_states(
-    file_info: &[(InputFile, usize)],
+    file_info: &[FileInfo],
+    selection_mode: SelectionMode,
+    expected_columns: usize,
     windows: &[usize],
     fallback: &str,
     progress: &Arc<ProgressUi>,
@@ -568,15 +924,22 @@ fn compute_start_states(
         .collect::<Vec<_>>();
     let mut start_states = Vec::with_capacity(file_info.len());
 
-    for (file, row_count) in file_info {
-        let name = file
+    for file_info in file_info {
+        let name = file_info
+            .file
             .path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("?");
-        let slot = progress.acquire_slot(name, *row_count as u64);
+        let progress_slot = should_process_file(file_info, selection_mode, expected_columns)
+            .then(|| progress.acquire_slot(name, file_info.row_count.map(|row_count| row_count as u64)));
         start_states.push(rolling_states.clone());
-        scan_close_column_into_states(&file.path, &mut rolling_states, fallback, &slot)?;
+        scan_close_column_into_states(
+            &file_info.file.path,
+            &mut rolling_states,
+            fallback,
+            progress_slot.as_ref(),
+        )?;
     }
 
     Ok(start_states)
@@ -586,10 +949,11 @@ fn scan_close_column_into_states(
     input_path: &Path,
     states: &mut [RsiState],
     fallback: &str,
-    progress: &ProgressSlot,
+    progress: Option<&ProgressSlot>,
 ) -> Result<()> {
     let mut reader = ReaderBuilder::new()
         .has_headers(false)
+        .flexible(true)
         .from_path(input_path)
         .with_context(|| format!("failed to open {}", input_path.display()))?;
 
@@ -607,13 +971,17 @@ fn scan_close_column_into_states(
 
         pending_progress += 1;
         if pending_progress >= 8192 {
-            progress.inc(pending_progress);
+            if let Some(progress) = progress {
+                progress.inc(pending_progress);
+            }
             pending_progress = 0;
         }
     }
 
     if pending_progress > 0 {
-        progress.inc(pending_progress);
+        if let Some(progress) = progress {
+            progress.inc(pending_progress);
+        }
     }
 
     Ok(())
@@ -633,6 +1001,7 @@ fn process_file(
     let write_result = (|| -> Result<()> {
         let mut reader = ReaderBuilder::new()
             .has_headers(false)
+            .flexible(true)
             .from_path(input_path)
             .with_context(|| format!("failed to open {}", input_path.display()))?;
 
@@ -818,6 +1187,26 @@ mod tests {
         assert_eq!(cli.column, 12);
         assert!(cli.copy);
         assert!(!cli.overwrite);
+        assert!(!cli.auto);
+        assert!(!cli.all);
+    }
+
+    #[test]
+    fn cli_parses_auto_and_rejects_auto_all_together() {
+        let cli = Cli::try_parse_from(["add-rsi", "-d", "/tmp/input", "--auto"])
+            .expect("parse auto CLI");
+
+        assert!(cli.auto);
+        assert!(!cli.all);
+
+        assert!(Cli::try_parse_from([
+            "add-rsi",
+            "-d",
+            "/tmp/input",
+            "--auto",
+            "--all",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -896,6 +1285,8 @@ mod tests {
             no_carry: false,
             carry: true,
             jobs: 5,
+            auto: false,
+            all: false,
             overwrite: true,
             copy: false,
         })
@@ -935,6 +1326,8 @@ mod tests {
             no_carry: false,
             carry: true,
             jobs: 5,
+            auto: false,
+            all: false,
             overwrite: false,
             copy: true,
         })
@@ -969,6 +1362,8 @@ mod tests {
             no_carry: false,
             carry: true,
             jobs: 5,
+            auto: false,
+            all: false,
             overwrite: true,
             copy: false,
         })
@@ -979,6 +1374,105 @@ mod tests {
 
         let second_value = february_rows[1][12].parse::<f64>().unwrap();
         assert!((second_value - 83.33333333333333).abs() < 1e-12);
+    }
+
+    #[test]
+    fn auto_analysis_reads_only_first_row_and_does_not_pre_count_rows() {
+        let test_dir = TestDir::new();
+        let file_path = test_dir.path.join("SOLUSDT-1s-2024-01.csv");
+
+        write_rows(
+            &file_path,
+            &[
+                kline_row("10", &[]),
+                kline_row("11", &["old-rsi-a", "old-rsi-b"]),
+            ],
+        );
+
+        let stats = analyze_file_for_auto(&file_path, 12).expect("analyze file");
+
+        assert_eq!(stats.row_count, None);
+        assert_eq!(stats.min_columns, Some(12));
+        assert_eq!(stats.max_columns, Some(12));
+    }
+
+    #[test]
+    fn auto_analysis_uses_first_row_to_mark_overwide_files() {
+        let test_dir = TestDir::new();
+        let file_path = test_dir.path.join("SOLUSDT-1s-2024-01.csv");
+
+        write_rows(
+            &file_path,
+            &[
+                kline_row("10", &["old-rsi-a", "old-rsi-b"]),
+                kline_row("11", &[]),
+            ],
+        );
+
+        let stats = analyze_file_for_auto(&file_path, 12).expect("analyze file");
+        let file_info = FileInfo {
+            file: InputFile {
+                path: file_path,
+                year: 2024,
+                month: 1,
+            },
+            row_count: stats.row_count,
+            min_columns: stats.min_columns,
+            max_columns: stats.max_columns,
+        };
+
+        assert_eq!(stats.row_count, None);
+        assert_eq!(stats.min_columns, Some(14));
+        assert_eq!(stats.max_columns, Some(14));
+        assert!(!file_info.is_auto_processable(12));
+    }
+
+    #[test]
+    fn auto_carry_skips_overwide_files_but_scans_them_for_state() {
+        let test_dir = TestDir::new();
+        let january = test_dir.path.join("SOLUSDT-1s-2024-01.csv");
+        let february = test_dir.path.join("SOLUSDT-1s-2024-02.csv");
+        let march = test_dir.path.join("SOLUSDT-1s-2024-03.csv");
+
+        write_rows(&january, &[kline_row("10", &[]), kline_row("11", &[])]);
+        write_rows(
+            &february,
+            &[
+                kline_row("10", &["old-rsi-a", "old-rsi-b"]),
+                kline_row("12", &["old-rsi-c", "old-rsi-d"]),
+            ],
+        );
+        write_rows(&march, &[kline_row("11", &[]), kline_row("13", &[])]);
+
+        run(Cli {
+            dir: test_dir.path.clone(),
+            name: "SOLUSDT".to_owned(),
+            interval: "1s".to_owned(),
+            column: 12,
+            windows: vec![2],
+            fallback: "NA".to_owned(),
+            no_carry: false,
+            carry: true,
+            jobs: 5,
+            auto: true,
+            all: false,
+            overwrite: true,
+            copy: false,
+        })
+        .expect("run auto carry mode");
+
+        let january_rows = read_rows(&january);
+        let february_rows = read_rows(&february);
+        let march_rows = read_rows(&march);
+
+        assert_eq!(january_rows[0].len(), 13);
+        assert_eq!(february_rows[0].len(), 14);
+        assert!(february_rows[0].contains(&"old-rsi-a".to_owned()));
+        assert_eq!(march_rows[0].len(), 13);
+        assert_eq!(march_rows[0][12].parse::<f64>().unwrap(), 50.0);
+
+        let second_march_value = march_rows[1][12].parse::<f64>().unwrap();
+        assert!((second_march_value - 80.76923076923077).abs() < 1e-12);
     }
 
     #[test]
@@ -1005,6 +1499,8 @@ mod tests {
             no_carry: false,
             carry: true,
             jobs: 5,
+            auto: false,
+            all: false,
             overwrite: true,
             copy: false,
         })
