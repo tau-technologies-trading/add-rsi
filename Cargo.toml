@@ -1,6 +1,6 @@
 [package]
 name = "add-rsi"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 
 [dependencies]
@@ -15,4 +15,3 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
-
