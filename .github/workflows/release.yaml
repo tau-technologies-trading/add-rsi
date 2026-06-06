@@ -1,0 +1,164 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: blacksmith-4vcpu-ubuntu-2404
+            binary: add-rsi
+
+          - target: aarch64-unknown-linux-gnu
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            binary: add-rsi
+
+          - target: x86_64-apple-darwin
+            runner: blacksmith-6vcpu-macos-15
+            binary: add-rsi
+
+          - target: aarch64-apple-darwin
+            runner: blacksmith-6vcpu-macos-15
+            binary: add-rsi
+
+          - target: x86_64-pc-windows-msvc
+            runner: blacksmith-4vcpu-ubuntu-2404
+            binary: add-rsi.exe
+            xwin: true
+
+          - target: aarch64-pc-windows-msvc
+            runner: blacksmith-4vcpu-ubuntu-2404
+            binary: add-rsi.exe
+            xwin: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Windows cross-build dependencies
+        if: matrix.xwin == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm
+          cargo install --locked cargo-xwin
+
+      - name: Build Windows release binary
+        if: matrix.xwin == true
+        run: cargo xwin build --release --target ${{ matrix.target }}
+
+      - name: Build release binary
+        if: matrix.xwin != true
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: add-rsi-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Read package version
+        id: version
+        run: |
+          version="$(python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          with Path("Cargo.toml").open("rb") as manifest:
+              print(tomllib.load(manifest)["package"]["version"])
+          PY
+          )"
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Download binaries
+        uses: actions/download-artifact@v8.0.1
+        with:
+          path: artifacts
+
+      - name: Package release assets
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          dist = Path("dist")
+          dist.mkdir(exist_ok=True)
+
+          unix_targets = [
+              "x86_64-unknown-linux-gnu",
+              "aarch64-unknown-linux-gnu",
+              "x86_64-apple-darwin",
+              "aarch64-apple-darwin",
+          ]
+
+          windows_targets = [
+              "x86_64-pc-windows-msvc",
+              "aarch64-pc-windows-msvc",
+          ]
+
+          for target in unix_targets:
+              source = Path("artifacts") / f"add-rsi-{target}" / "add-rsi"
+              archive = dist / f"add-rsi-{tag}-{target}.tar.gz"
+
+              if not source.exists():
+                  raise FileNotFoundError(source)
+
+              with tarfile.open(archive, "w:gz") as tar:
+                  info = tar.gettarinfo(source, arcname="add-rsi")
+                  info.mode = 0o755
+
+                  with source.open("rb") as binary:
+                      tar.addfile(info, binary)
+
+          for target in windows_targets:
+              source = Path("artifacts") / f"add-rsi-{target}" / "add-rsi.exe"
+              archive = dist / f"add-rsi-{tag}-{target}.zip"
+
+              if not source.exists():
+                  raise FileNotFoundError(source)
+
+              with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                  zip_file.write(source, arcname="add-rsi.exe")
+          PY
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" dist/* \
+            --title "${{ steps.version.outputs.tag }}" \
+            --notes "Release ${{ steps.version.outputs.tag }}"
