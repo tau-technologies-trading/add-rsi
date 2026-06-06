@@ -615,42 +615,20 @@ fn list_directory_and_confirm(
     options: InspectionOptions,
 ) -> Result<Vec<FileInfo>> {
     let parallel_files = parallel_file_count(files.len(), options.jobs);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(parallel_files)
-        .build()
-        .context("failed to build Rayon inspection thread pool")?;
-
-    println!(
-        "\n{} with up to {} in parallel...",
-        match (options.selection_mode, options.auto_inspect_mode) {
-            (SelectionMode::Auto, AutoInspectMode::FirstRow) => "Checking first-row RSI cells",
-            (SelectionMode::Auto, AutoInspectMode::LastRow) => "Checking last-row RSI cells",
-            (SelectionMode::All, _) => "Counting rows and columns",
-        },
-        parallel_summary(parallel_files)
-    );
-    let file_info = pool.install(|| {
-        files
-            .par_iter()
-            .map(|file| {
-                let stats = analyze_file(
-                    &file.path,
-                    options.selection_mode,
-                    options.auto_inspect_mode,
-                    options.expected_columns,
-                    options.rsi_column_count,
-                )
-                .with_context(|| format!("failed to inspect {}", file.path.display()))?;
-                Ok::<_, anyhow::Error>(FileInfo {
-                    file: file.clone(),
-                    row_count: stats.row_count,
-                    min_columns: stats.min_columns,
-                    max_columns: stats.max_columns,
-                    auto_processable: stats.auto_processable,
-                })
-            })
-            .collect::<Result<Vec<_>>>()
-    })?;
+    let file_info = match options.selection_mode {
+        SelectionMode::Auto => {
+            println!(
+                "\n{} with up to {} in parallel...",
+                match options.auto_inspect_mode {
+                    AutoInspectMode::FirstRow => "Checking first-row RSI cells",
+                    AutoInspectMode::LastRow => "Checking last-row RSI cells",
+                },
+                parallel_summary(parallel_files)
+            );
+            inspect_files_parallel(files, options, parallel_files)?
+        }
+        SelectionMode::All => inspect_all_files_by_folder(files, options)?,
+    };
 
     let total_files = file_info.len();
     let total_rows = sum_counted_rows(&file_info);
@@ -691,6 +669,10 @@ fn list_directory_and_confirm(
         process_files.len(),
         describe_total_rows(process_rows)
     );
+
+    if options.selection_mode == SelectionMode::All {
+        print_folder_summary("Folders to process:", &process_files);
+    }
 
     print_file_list("Files to process:", &process_files);
 
@@ -740,6 +722,97 @@ fn list_directory_and_confirm(
     }
 
     Ok(file_info)
+}
+
+fn inspect_files_parallel(
+    files: &[InputFile],
+    options: InspectionOptions,
+    parallel_files: usize,
+) -> Result<Vec<FileInfo>> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(parallel_files)
+        .build()
+        .context("failed to build Rayon inspection thread pool")?;
+
+    pool.install(|| {
+        files
+            .par_iter()
+            .map(|file| {
+                let stats = analyze_file(
+                    &file.path,
+                    options.selection_mode,
+                    options.auto_inspect_mode,
+                    options.expected_columns,
+                    options.rsi_column_count,
+                )
+                .with_context(|| format!("failed to inspect {}", file.path.display()))?;
+                Ok::<_, anyhow::Error>(FileInfo {
+                    file: file.clone(),
+                    row_count: stats.row_count,
+                    min_columns: stats.min_columns,
+                    max_columns: stats.max_columns,
+                    auto_processable: stats.auto_processable,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+    })
+}
+
+fn inspect_all_files_by_folder(
+    files: &[InputFile],
+    options: InspectionOptions,
+) -> Result<Vec<FileInfo>> {
+    let groups = group_input_files_by_folder(files);
+    let parallel_files = groups
+        .iter()
+        .map(|group| parallel_file_count(group.len(), options.jobs))
+        .max()
+        .unwrap_or_else(|| parallel_file_count(files.len(), options.jobs));
+
+    println!(
+        "\nCounting rows and columns folder by folder, with up to {} in parallel per folder...",
+        parallel_summary(parallel_files)
+    );
+    print_input_folder_summary("Folders to scan:", &groups);
+
+    let mut file_info = Vec::with_capacity(files.len());
+
+    for group in groups {
+        let folder = group[0].group.display();
+        let folder_parallel_files = parallel_file_count(group.len(), options.jobs);
+        println!(
+            "\nCounting {folder}: {} files with up to {} in parallel...",
+            group.len(),
+            parallel_summary(folder_parallel_files)
+        );
+
+        let mut group_info = inspect_files_parallel(group, options, folder_parallel_files)?;
+        println!(
+            "Counted {folder}: {} files, {}",
+            group_info.len(),
+            describe_total_rows(sum_counted_rows(&group_info))
+        );
+        file_info.append(&mut group_info);
+    }
+
+    Ok(file_info)
+}
+
+fn group_input_files_by_folder(files: &[InputFile]) -> Vec<&[InputFile]> {
+    let mut groups = Vec::new();
+    let mut start = 0_usize;
+
+    while start < files.len() {
+        let mut end = start + 1;
+        while end < files.len() && files[end].group == files[start].group {
+            end += 1;
+        }
+
+        groups.push(&files[start..end]);
+        start = end;
+    }
+
+    groups
 }
 
 fn sum_counted_rows(file_info: &[FileInfo]) -> Option<usize> {
@@ -796,6 +869,41 @@ fn print_file_list(title: &str, file_info: &[FileInfo]) {
             file_name,
             describe_row_count(file_info.row_count),
             describe_column_range(file_info.min_columns, file_info.max_columns)
+        );
+    }
+}
+
+fn print_input_folder_summary(title: &str, groups: &[&[InputFile]]) {
+    if groups.is_empty() {
+        println!("{title} none");
+        return;
+    }
+
+    println!("\n{title}");
+    for group in groups {
+        println!(
+            "  {}: {} file{}",
+            group[0].group.display(),
+            group.len(),
+            if group.len() == 1 { "" } else { "s" }
+        );
+    }
+}
+
+fn print_folder_summary(title: &str, file_info: &[FileInfo]) {
+    if file_info.is_empty() {
+        println!("{title} none");
+        return;
+    }
+
+    println!("{title}");
+    for group in group_file_info(file_info.to_vec()) {
+        println!(
+            "  {}: {} file{}, {}",
+            group[0].file.group.display(),
+            group.len(),
+            if group.len() == 1 { "" } else { "s" },
+            describe_total_rows(sum_counted_rows(&group))
         );
     }
 }
@@ -1529,6 +1637,75 @@ mod tests {
                 "spot/BTCUSDT/BTCUSDT-1s-2024-02.csv",
             ]
         );
+    }
+
+    #[test]
+    fn group_input_files_by_folder_preserves_sorted_folder_runs() {
+        let test_dir = TestDir::new();
+        let btc_dir = test_dir.path.join("BTCUSDT");
+        let eth_dir = test_dir.path.join("ETHUSDT");
+        fs::create_dir_all(&btc_dir).expect("create BTC directory");
+        fs::create_dir_all(&eth_dir).expect("create ETH directory");
+
+        fs::write(btc_dir.join("BTCUSDT-1s-2024-01.csv"), "").expect("write BTC CSV");
+        fs::write(btc_dir.join("BTCUSDT-1s-2024-02.csv"), "").expect("write BTC CSV");
+        fs::write(eth_dir.join("ETHUSDT-1s-2024-01.csv"), "").expect("write ETH CSV");
+
+        let files = collect_all_input_files(&test_dir.path, "1s").expect("collect all files");
+        let groups = group_input_files_by_folder(&files);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[0][0].group, btc_dir);
+        assert_eq!(groups[1].len(), 1);
+        assert_eq!(groups[1][0].group, eth_dir);
+    }
+
+    #[test]
+    fn all_inspection_counts_rows_folder_by_folder() {
+        let test_dir = TestDir::new();
+        let btc_dir = test_dir.path.join("BTCUSDT");
+        let eth_dir = test_dir.path.join("ETHUSDT");
+        fs::create_dir_all(&btc_dir).expect("create BTC directory");
+        fs::create_dir_all(&eth_dir).expect("create ETH directory");
+        let btc_january = btc_dir.join("BTCUSDT-1s-2024-01.csv");
+        let btc_february = btc_dir.join("BTCUSDT-1s-2024-02.csv");
+        let eth_january = eth_dir.join("ETHUSDT-1s-2024-01.csv");
+
+        write_rows(&btc_january, &[kline_row("10", &[]), kline_row("11", &[])]);
+        write_rows(&btc_february, &[kline_row("12", &[])]);
+        write_rows(
+            &eth_january,
+            &[
+                kline_row("20", &[]),
+                kline_row("21", &[]),
+                kline_row("22", &["extra"]),
+            ],
+        );
+
+        let files = collect_all_input_files(&test_dir.path, "1s").expect("collect all files");
+        let file_info = inspect_all_files_by_folder(
+            &files,
+            InspectionOptions {
+                mode: OutputMode::Overwrite,
+                selection_mode: SelectionMode::All,
+                auto_inspect_mode: AutoInspectMode::LastRow,
+                expected_columns: 12,
+                rsi_column_count: 1,
+                jobs: 2,
+                skip_confirmation: true,
+            },
+        )
+        .expect("inspect all files");
+
+        assert_eq!(file_info.len(), 3);
+        assert_eq!(sum_counted_rows(&file_info), Some(6));
+        assert_eq!(file_info[0].file.group, btc_dir);
+        assert_eq!(file_info[0].row_count, Some(2));
+        assert_eq!(file_info[1].row_count, Some(1));
+        assert_eq!(file_info[2].file.group, eth_dir);
+        assert_eq!(file_info[2].row_count, Some(3));
+        assert_eq!(file_info[2].max_columns, Some(13));
     }
 
     #[test]
