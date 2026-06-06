@@ -1,8 +1,8 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -11,6 +11,8 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
 const CLOSE_COLUMN_INDEX: usize = 4;
+const DEFAULT_DATA_DIR: &str = "../data/BTCUSDT/";
+const DEFAULT_ALL_DATA_DIR: &str = "../data/";
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Parser, Debug)]
@@ -19,15 +21,15 @@ static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
     long_about = "Add Wilder RSI columns to Binance Vision CSV files.\n\nBy default this processes every matching file independently in parallel, overwriting the original CSVs after confirmation. Use --auto to skip files whose inspected row already has the requested RSI columns filled in and skip the confirmation prompt. In --auto without --carry, each file is classified from its last CSV row. In --auto with --carry, each file is classified from its first CSV row, and skipped files are not row-counted, scanned, or written. Use --carry for RSI continuity across the selected files. Use --copy if you want sibling .rsi.csv outputs instead of replacing the originals.",
     version,
     disable_version_flag = true,
-    after_help = "Examples:\n  add-rsi -d ../data\n  add-rsi -d ../data --jobs 3\n  add-rsi -d ../data --auto --carry --jobs 5\n  add-rsi -d ../data --all --copy --window 14,64,256\n\nNotes:\n  --jobs is a maximum; the program uses fewer workers if fewer files exist.\n  --auto without --carry skips files whose last CSV row has all requested RSI columns present and non-empty.\n  --auto --carry skips files whose first CSV row has all requested RSI columns present and non-empty. Skipped files are not written, row-counted, or scanned.\n  --all processes every matching file, including files with more than --column columns. Extra columns are dropped before RSI values are appended.\n  Set ADD_RSI_NO_CONFIRM=1 to skip the confirmation prompt."
+    after_help = "Examples:\n  add-rsi\n  add-rsi --jobs 3\n  add-rsi --auto --carry --jobs 5\n  add-rsi --all --copy --window 14,64,256\n\nNotes:\n  Without --all, --dir defaults to ../data/BTCUSDT/.\n  With --all, --dir defaults to ../data/ unless -d/--dir is provided.\n  --jobs is a maximum; the program uses fewer workers if fewer files or carry groups exist.\n  --auto without --carry skips files whose last CSV row has all requested RSI columns present and non-empty.\n  --auto --carry skips files whose first CSV row has all requested RSI columns present and non-empty. Skipped files are not written, row-counted, or scanned.\n  --all recursively processes matching CSV files, using each CSV parent directory name as its file-name prefix and carrying RSI state independently per parent directory. Extra columns are dropped before RSI values are appended.\n  Set ADD_RSI_NO_CONFIRM=1 to skip the confirmation prompt."
 )]
 struct Cli {
     /// Directory containing the CSV files to process.
-    #[arg(short = 'd', long = "dir")]
+    #[arg(short = 'd', long = "dir", default_value = DEFAULT_DATA_DIR)]
     dir: PathBuf,
 
     /// File name prefix (e.g. SOLUSDT).
-    #[arg(short = 'n', long = "name", default_value = "SOLUSDT")]
+    #[arg(short = 'n', long = "name", default_value = "BTCUSDT")]
     name: String,
 
     /// Time interval in seconds (e.g. 1s, 5m, 1h).
@@ -103,9 +105,21 @@ enum AutoInspectMode {
     LastRow,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct InspectionOptions {
+    mode: OutputMode,
+    selection_mode: SelectionMode,
+    auto_inspect_mode: AutoInspectMode,
+    expected_columns: usize,
+    rsi_column_count: usize,
+    jobs: usize,
+    skip_confirmation: bool,
+}
+
 #[derive(Clone, Debug)]
 struct InputFile {
     path: PathBuf,
+    group: PathBuf,
     year: u32,
     month: u32,
 }
@@ -327,20 +341,41 @@ fn main() {
         return;
     }
 
-    if let Err(error) = run(Cli::parse()) {
+    let dir_was_provided = dir_arg_was_provided();
+
+    if let Err(error) = run_with_dir_source(Cli::parse(), dir_was_provided) {
         eprintln!("{error:#}");
         std::process::exit(1);
     }
+}
+
+fn dir_arg_was_provided() -> bool {
+    std::env::args_os().skip(1).any(|arg| {
+        arg == "-d"
+            || arg == "--dir"
+            || arg
+                .to_str()
+                .map(|arg| arg.starts_with("--dir="))
+                .unwrap_or(false)
+    })
 }
 
 fn print_version() {
     println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 }
 
+#[cfg(test)]
 fn run(cli: Cli) -> Result<()> {
+    run_with_dir_source(cli, true)
+}
+
+fn run_with_dir_source(mut cli: Cli, dir_was_provided: bool) -> Result<()> {
     let _ = cli.version_flag;
     let _ = cli.no_carry;
-    let _ = cli.all;
+
+    if cli.all && !dir_was_provided && cli.dir == Path::new(DEFAULT_DATA_DIR) {
+        cli.dir = PathBuf::from(DEFAULT_ALL_DATA_DIR);
+    }
 
     if !cli.dir.is_dir() {
         bail!("{} is not a directory", cli.dir.display());
@@ -348,14 +383,26 @@ fn run(cli: Cli) -> Result<()> {
 
     validate_windows(&cli.windows)?;
 
-    let files = collect_input_files(&cli.dir, &cli.name, &cli.interval)?;
+    let files = if cli.all {
+        collect_all_input_files(&cli.dir, &cli.interval)?
+    } else {
+        collect_input_files(&cli.dir, &cli.name, &cli.interval)?
+    };
     if files.is_empty() {
-        bail!(
-            "no matching CSV files found in {} for prefix {}-{}",
-            cli.dir.display(),
-            cli.name,
-            cli.interval
-        );
+        if cli.all {
+            bail!(
+                "no matching CSV files found recursively in {} using parent-directory prefixes and interval {}",
+                cli.dir.display(),
+                cli.interval
+            );
+        } else {
+            bail!(
+                "no matching CSV files found in {} for prefix {}-{}",
+                cli.dir.display(),
+                cli.name,
+                cli.interval
+            );
+        }
     }
 
     let mode = match (cli.overwrite, cli.copy) {
@@ -377,13 +424,15 @@ fn run(cli: Cli) -> Result<()> {
     let file_info = list_directory_and_confirm(
         &cli.dir,
         &files,
-        mode,
-        selection_mode,
-        auto_inspect_mode,
-        cli.column,
-        cli.windows.len(),
-        cli.jobs,
-        skip_confirmation,
+        InspectionOptions {
+            mode,
+            selection_mode,
+            auto_inspect_mode,
+            expected_columns: cli.column,
+            rsi_column_count: cli.windows.len(),
+            jobs: cli.jobs,
+            skip_confirmation,
+        },
     )?;
     let files_to_process = select_process_files(&file_info, selection_mode, cli.column);
 
@@ -397,54 +446,42 @@ fn run(cli: Cli) -> Result<()> {
     let process_total_rows = sum_counted_rows(&files_to_process);
 
     if cli.carry {
-        let scan_total_rows = process_total_rows;
-        let parallel_files = parallel_file_count(files_to_process.len(), cli.jobs);
+        let file_groups = group_file_info(files_to_process);
+        let parallel_groups = parallel_file_count(file_groups.len(), cli.jobs);
         println!(
-            "\nCarryover mode: scanning {} selected file{} for RSI start states, then processing {} in parallel.",
-            files_to_process.len(),
-            if files_to_process.len() == 1 { "" } else { "s" },
-            parallel_summary(parallel_files)
+            "\nCarryover mode: processing {} in parallel; RSI state resets for each parent-directory group.",
+            group_summary(parallel_groups)
         );
         if selection_mode == SelectionMode::Auto {
             println!("Carryover mode: skipped --auto files are not scanned.");
         }
 
-        let carry_progress = ProgressUi::new("CARRY ", scan_total_rows.map(|row_count| row_count as u64), 1);
-        let start_states = compute_start_states(
-            &files_to_process,
-            &cli.windows,
-            &cli.fallback,
-            &carry_progress,
-        )?;
-        carry_progress.finish();
-
-        let process_plan = files_to_process
-            .iter()
-            .cloned()
-            .zip(start_states)
-            .collect::<Vec<_>>();
-
-        let process_progress = ProgressUi::new("TOTAL ", process_total_rows.map(|row_count| row_count as u64), parallel_files);
+        let process_progress = ProgressUi::new(
+            "TOTAL ",
+            process_total_rows.map(|row_count| row_count as u64),
+            parallel_groups,
+        );
+        let windows = cli.windows.clone();
         let fallback = cli.fallback.clone();
         let column = cli.column;
 
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(parallel_files)
+            .num_threads(parallel_groups)
             .build()
             .context("failed to build Rayon thread pool")?;
 
         let result = pool.install(|| {
-            process_plan
-                .into_par_iter()
-                .try_for_each(|(file_info, mut states)| {
-                    let name = file_info
-                        .file
-                        .path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("?");
-                    let slot = process_progress.acquire_slot(name, file_info.row_count.map(|row_count| row_count as u64));
+            file_groups.into_par_iter().try_for_each(|group| {
+                let mut states = windows
+                    .iter()
+                    .copied()
+                    .map(RsiState::new)
+                    .collect::<Vec<_>>();
 
+                for file_info in group {
+                    let name = progress_name(&file_info.file);
+                    let slot = process_progress
+                        .acquire_slot(&name, file_info.row_count.map(|row_count| row_count as u64));
                     process_file(
                         &file_info.file.path,
                         column,
@@ -452,8 +489,11 @@ fn run(cli: Cli) -> Result<()> {
                         &mut states,
                         mode,
                         &slot,
-                    )
-                })
+                    )?;
+                }
+
+                Ok::<_, anyhow::Error>(())
+            })
         });
 
         process_progress.finish();
@@ -465,7 +505,11 @@ fn run(cli: Cli) -> Result<()> {
             parallel_summary(parallel_files)
         );
 
-        let process_progress = ProgressUi::new("TOTAL ", process_total_rows.map(|row_count| row_count as u64), parallel_files);
+        let process_progress = ProgressUi::new(
+            "TOTAL ",
+            process_total_rows.map(|row_count| row_count as u64),
+            parallel_files,
+        );
         let windows = cli.windows.clone();
         let fallback = cli.fallback.clone();
         let column = cli.column;
@@ -476,31 +520,25 @@ fn run(cli: Cli) -> Result<()> {
             .context("failed to build Rayon thread pool")?;
 
         let result = pool.install(|| {
-            files_to_process
-                .into_par_iter()
-                .try_for_each(|file_info| {
-                    let name = file_info
-                        .file
-                        .path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("?");
-                    let slot = process_progress.acquire_slot(name, file_info.row_count.map(|row_count| row_count as u64));
-                    let mut states = windows
-                        .iter()
-                        .copied()
-                        .map(RsiState::new)
-                        .collect::<Vec<_>>();
+            files_to_process.into_par_iter().try_for_each(|file_info| {
+                let name = progress_name(&file_info.file);
+                let slot = process_progress
+                    .acquire_slot(&name, file_info.row_count.map(|row_count| row_count as u64));
+                let mut states = windows
+                    .iter()
+                    .copied()
+                    .map(RsiState::new)
+                    .collect::<Vec<_>>();
 
-                    process_file(
-                        &file_info.file.path,
-                        column,
-                        &fallback,
-                        &mut states,
-                        mode,
-                        &slot,
-                    )
-                })
+                process_file(
+                    &file_info.file.path,
+                    column,
+                    &fallback,
+                    &mut states,
+                    mode,
+                    &slot,
+                )
+            })
         });
 
         process_progress.finish();
@@ -519,9 +557,6 @@ fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-
-
-
 fn parallel_file_count(file_count: usize, requested_jobs: usize) -> usize {
     requested_jobs.max(1).min(file_count.max(1))
 }
@@ -534,18 +569,52 @@ fn parallel_summary(parallel_files: usize) -> String {
     }
 }
 
+fn group_summary(parallel_groups: usize) -> String {
+    if parallel_groups == 1 {
+        "1 group".to_owned()
+    } else {
+        format!("{parallel_groups} groups")
+    }
+}
+
+fn group_file_info(file_info: Vec<FileInfo>) -> Vec<Vec<FileInfo>> {
+    let mut groups = Vec::<Vec<FileInfo>>::new();
+
+    for file_info in file_info {
+        if let Some(group) = groups
+            .last_mut()
+            .filter(|group| group[0].file.group == file_info.file.group)
+        {
+            group.push(file_info);
+        } else {
+            groups.push(vec![file_info]);
+        }
+    }
+
+    groups
+}
+
+fn progress_name(file: &InputFile) -> String {
+    let group_name = file
+        .group
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("?");
+    let file_name = file
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("?");
+
+    format!("{group_name}/{file_name}")
+}
+
 fn list_directory_and_confirm(
     dir: &Path,
     files: &[InputFile],
-    mode: OutputMode,
-    selection_mode: SelectionMode,
-    auto_inspect_mode: AutoInspectMode,
-    expected_columns: usize,
-    rsi_column_count: usize,
-    jobs: usize,
-    skip_confirmation: bool,
+    options: InspectionOptions,
 ) -> Result<Vec<FileInfo>> {
-    let parallel_files = parallel_file_count(files.len(), jobs);
+    let parallel_files = parallel_file_count(files.len(), options.jobs);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(parallel_files)
         .build()
@@ -553,7 +622,7 @@ fn list_directory_and_confirm(
 
     println!(
         "\n{} with up to {} in parallel...",
-        match (selection_mode, auto_inspect_mode) {
+        match (options.selection_mode, options.auto_inspect_mode) {
             (SelectionMode::Auto, AutoInspectMode::FirstRow) => "Checking first-row RSI cells",
             (SelectionMode::Auto, AutoInspectMode::LastRow) => "Checking last-row RSI cells",
             (SelectionMode::All, _) => "Counting rows and columns",
@@ -566,10 +635,10 @@ fn list_directory_and_confirm(
             .map(|file| {
                 let stats = analyze_file(
                     &file.path,
-                    selection_mode,
-                    auto_inspect_mode,
-                    expected_columns,
-                    rsi_column_count,
+                    options.selection_mode,
+                    options.auto_inspect_mode,
+                    options.expected_columns,
+                    options.rsi_column_count,
                 )
                 .with_context(|| format!("failed to inspect {}", file.path.display()))?;
                 Ok::<_, anyhow::Error>(FileInfo {
@@ -585,11 +654,14 @@ fn list_directory_and_confirm(
 
     let total_files = file_info.len();
     let total_rows = sum_counted_rows(&file_info);
-    let process_files = select_process_files(&file_info, selection_mode, expected_columns);
+    let process_files =
+        select_process_files(&file_info, options.selection_mode, options.expected_columns);
     let process_rows = sum_counted_rows(&process_files);
     let skipped_files = file_info
         .iter()
-        .filter(|file_info| !should_process_file(file_info, selection_mode, expected_columns))
+        .filter(|file_info| {
+            !should_process_file(file_info, options.selection_mode, options.expected_columns)
+        })
         .cloned()
         .collect::<Vec<_>>();
 
@@ -599,11 +671,11 @@ fn list_directory_and_confirm(
         total_files,
         describe_total_rows(total_rows)
     );
-    println!("Column target: {expected_columns}");
+    println!("Column target: {}", options.expected_columns);
     println!(
         "Selection mode: {}",
-        match selection_mode {
-            SelectionMode::Auto => match auto_inspect_mode {
+        match options.selection_mode {
+            SelectionMode::Auto => match options.auto_inspect_mode {
                 AutoInspectMode::FirstRow => {
                     "auto: skip files whose first row has all requested RSI columns filled"
                 }
@@ -624,8 +696,8 @@ fn list_directory_and_confirm(
 
     if !skipped_files.is_empty() {
         print_file_list("Files skipped by --auto:", &skipped_files);
-        if selection_mode == SelectionMode::Auto {
-            match auto_inspect_mode {
+        if options.selection_mode == SelectionMode::Auto {
+            match options.auto_inspect_mode {
                 AutoInspectMode::FirstRow => println!(
                     "Skipped files are not written, row-counted, or scanned. RSI state carries across selected files only."
                 ),
@@ -638,21 +710,21 @@ fn list_directory_and_confirm(
 
     warn_about_extra_columns(
         &file_info,
-        selection_mode,
-        auto_inspect_mode,
-        expected_columns,
+        options.selection_mode,
+        options.auto_inspect_mode,
+        options.expected_columns,
     );
     warn_about_missing_months(&file_info);
 
     println!(
         "Output mode: {}",
-        match mode {
+        match options.mode {
             OutputMode::Overwrite => "overwrite in place",
             OutputMode::Copy => "copy to .rsi.csv",
         }
     );
 
-    if cfg!(test) || skip_confirmation {
+    if cfg!(test) || options.skip_confirmation {
         return Ok(file_info);
     }
 
@@ -717,12 +789,7 @@ fn print_file_list(title: &str, file_info: &[FileInfo]) {
 
     println!("{title}");
     for (index, file_info) in file_info.iter().enumerate() {
-        let file_name = file_info
-            .file
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?");
+        let file_name = progress_name(&file_info.file);
         println!(
             "  {}. {} ({} rows, {})",
             index + 1,
@@ -839,8 +906,8 @@ fn analyze_file_fully(path: &Path) -> Result<FileStats> {
     let mut max_columns = None::<usize>;
 
     for result in reader.records() {
-        let record = result
-            .with_context(|| format!("failed to read CSV record from {}", path.display()))?;
+        let record =
+            result.with_context(|| format!("failed to read CSV record from {}", path.display()))?;
         let columns = record.len();
         row_count += 1;
         min_columns = Some(min_columns.map_or(columns, |current| current.min(columns)));
@@ -893,8 +960,8 @@ fn analyze_file_for_auto_first_row(
     let mut max_columns = Some(columns);
 
     for result in reader.records() {
-        let record = result
-            .with_context(|| format!("failed to read CSV record from {}", path.display()))?;
+        let record =
+            result.with_context(|| format!("failed to read CSV record from {}", path.display()))?;
         let columns = record.len();
         row_count += 1;
         min_columns = Some(min_columns.map_or(columns, |current| current.min(columns)));
@@ -926,8 +993,8 @@ fn analyze_file_for_auto_last_row(
     let mut last_record = None::<StringRecord>;
 
     for result in reader.records() {
-        let record = result
-            .with_context(|| format!("failed to read CSV record from {}", path.display()))?;
+        let record =
+            result.with_context(|| format!("failed to read CSV record from {}", path.display()))?;
         let columns = record.len();
         row_count += 1;
         min_columns = Some(min_columns.map_or(columns, |current| current.min(columns)));
@@ -964,20 +1031,24 @@ fn row_has_completed_appended_rsi_columns(
 }
 
 fn warn_about_missing_months(file_info: &[FileInfo]) {
-    let missing_months = find_missing_months(file_info);
-    if missing_months.is_empty() {
-        return;
-    }
+    for group in group_file_info(file_info.to_vec()) {
+        let missing_months = find_missing_months(&group);
+        if missing_months.is_empty() {
+            continue;
+        }
 
-    println!(
-        "\nWARNING: missing {} month{} between first and last file: {}",
-        missing_months.len(),
-        if missing_months.len() == 1 { "" } else { "s" },
-        missing_months.join(", ")
-    );
-    println!(
-        "         Carryover will continue across the gap, but the missing month data is not being processed."
-    );
+        let group_name = group[0].file.group.display();
+        println!(
+            "\nWARNING: {} is missing {} month{} between first and last file: {}",
+            group_name,
+            missing_months.len(),
+            if missing_months.len() == 1 { "" } else { "s" },
+            missing_months.join(", ")
+        );
+        println!(
+            "         Carryover will continue across the gap, but the missing month data is not being processed."
+        );
+    }
 }
 
 fn find_missing_months(file_info: &[FileInfo]) -> Vec<String> {
@@ -1016,13 +1087,12 @@ fn format_month_index(month_index: u32) -> String {
     format!("{year}-{month:02}")
 }
 
-
 fn validate_windows(windows: &[usize]) -> Result<()> {
     if windows.is_empty() {
         bail!("at least one RSI window is required");
     }
 
-    if windows.iter().any(|window| *window == 0) {
+    if windows.contains(&0) {
         bail!("RSI windows must be greater than zero");
     }
 
@@ -1050,19 +1120,78 @@ fn collect_input_files(dir: &Path, prefix: &str, interval: &str) -> Result<Vec<I
 
         files.push(InputFile {
             path: entry.path(),
+            group: dir.to_path_buf(),
             year,
             month,
         });
     }
 
+    sort_input_files(&mut files);
+
+    Ok(files)
+}
+
+fn collect_all_input_files(dir: &Path, interval: &str) -> Result<Vec<InputFile>> {
+    let mut files = Vec::new();
+    collect_all_input_files_into(dir, interval, &mut files)?;
+    sort_input_files(&mut files);
+    Ok(files)
+}
+
+fn collect_all_input_files_into(
+    dir: &Path,
+    interval: &str,
+    files: &mut Vec<InputFile>,
+) -> Result<()> {
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("failed to read directory {}", dir.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+
+        if file_type.is_dir() {
+            collect_all_input_files_into(&path, interval, files)?;
+            continue;
+        }
+
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let group = parent.to_path_buf();
+        let Some(prefix) = parent.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((year, month)) = parse_input_filename(file_name, prefix, interval) else {
+            continue;
+        };
+
+        files.push(InputFile {
+            path,
+            group,
+            year,
+            month,
+        });
+    }
+
+    Ok(())
+}
+
+fn sort_input_files(files: &mut [InputFile]) {
     files.sort_by(|left, right| {
-        left.year
-            .cmp(&right.year)
+        left.group
+            .cmp(&right.group)
+            .then(left.year.cmp(&right.year))
             .then(left.month.cmp(&right.month))
             .then(left.path.cmp(&right.path))
     });
-
-    Ok(files)
 }
 
 fn parse_input_filename(file_name: &str, prefix: &str, interval: &str) -> Option<(u32, u32)> {
@@ -1078,81 +1207,6 @@ fn parse_input_filename(file_name: &str, prefix: &str, interval: &str) -> Option
     }
 
     Some((year, month))
-}
-
-fn compute_start_states(
-    file_info: &[FileInfo],
-    windows: &[usize],
-    fallback: &str,
-    progress: &Arc<ProgressUi>,
-) -> Result<Vec<Vec<RsiState>>> {
-    let mut rolling_states = windows
-        .iter()
-        .copied()
-        .map(RsiState::new)
-        .collect::<Vec<_>>();
-    let mut start_states = Vec::with_capacity(file_info.len());
-
-    for file_info in file_info {
-        let name = file_info
-            .file
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?");
-        let progress_slot = progress.acquire_slot(name, file_info.row_count.map(|row_count| row_count as u64));
-        start_states.push(rolling_states.clone());
-        scan_close_column_into_states(
-            &file_info.file.path,
-            &mut rolling_states,
-            fallback,
-            Some(&progress_slot),
-        )?;
-    }
-
-    Ok(start_states)
-}
-
-fn scan_close_column_into_states(
-    input_path: &Path,
-    states: &mut [RsiState],
-    fallback: &str,
-    progress: Option<&ProgressSlot>,
-) -> Result<()> {
-    let mut reader = ReaderBuilder::new()
-        .has_headers(false)
-        .flexible(true)
-        .from_path(input_path)
-        .with_context(|| format!("failed to open {}", input_path.display()))?;
-
-    let mut pending_progress = 0_u64;
-
-    for result in reader.records() {
-        let record = result.with_context(|| {
-            format!("failed to read CSV record from {}", input_path.display())
-        })?;
-        let close = parse_close(&record);
-
-        for state in states.iter_mut() {
-            let _ = state.next_cell(close, fallback);
-        }
-
-        pending_progress += 1;
-        if pending_progress >= 8192 {
-            if let Some(progress) = progress {
-                progress.inc(pending_progress);
-            }
-            pending_progress = 0;
-        }
-    }
-
-    if pending_progress > 0 {
-        if let Some(progress) = progress {
-            progress.inc(pending_progress);
-        }
-    }
-
-    Ok(())
 }
 
 fn process_file(
@@ -1194,9 +1248,11 @@ fn process_file(
                 output.push(state.next_cell(close, fallback));
             }
 
-            writer.write_record(output.iter().map(String::as_str)).with_context(|| {
-                format!("failed to write CSV record to {}", temp_path.display())
-            })?;
+            writer
+                .write_record(output.iter().map(String::as_str))
+                .with_context(|| {
+                    format!("failed to write CSV record to {}", temp_path.display())
+                })?;
 
             pending_progress += 1;
             if pending_progress >= 8192 {
@@ -1228,7 +1284,6 @@ fn process_file(
 
     Ok(())
 }
-
 
 fn build_output_path(input_path: &Path, mode: OutputMode) -> Result<PathBuf> {
     match mode {
@@ -1267,7 +1322,7 @@ fn format_with_commas(n: usize) -> String {
     let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
 
     for (index, character) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             formatted.push(',');
         }
         formatted.push(character);
@@ -1275,7 +1330,6 @@ fn format_with_commas(n: usize) -> String {
 
     formatted
 }
-
 
 fn parse_close(record: &StringRecord) -> Option<f64> {
     record
@@ -1360,21 +1414,33 @@ mod tests {
     }
 
     #[test]
+    fn cli_uses_btcusdt_defaults() {
+        let cli = Cli::try_parse_from(["add-rsi"]).expect("parse default CLI");
+
+        assert_eq!(cli.dir, PathBuf::from(DEFAULT_DATA_DIR));
+        assert_eq!(cli.name, "BTCUSDT");
+    }
+
+    #[test]
+    fn all_without_explicit_dir_uses_all_data_default() {
+        let mut cli = Cli::try_parse_from(["add-rsi", "--all"]).expect("parse all CLI");
+
+        if cli.all && cli.dir == Path::new(DEFAULT_DATA_DIR) {
+            cli.dir = PathBuf::from(DEFAULT_ALL_DATA_DIR);
+        }
+
+        assert_eq!(cli.dir, PathBuf::from(DEFAULT_ALL_DATA_DIR));
+    }
+
+    #[test]
     fn cli_parses_auto_and_rejects_auto_all_together() {
-        let cli = Cli::try_parse_from(["add-rsi", "-d", "/tmp/input", "--auto"])
-            .expect("parse auto CLI");
+        let cli =
+            Cli::try_parse_from(["add-rsi", "-d", "/tmp/input", "--auto"]).expect("parse auto CLI");
 
         assert!(cli.auto);
         assert!(!cli.all);
 
-        assert!(Cli::try_parse_from([
-            "add-rsi",
-            "-d",
-            "/tmp/input",
-            "--auto",
-            "--all",
-        ])
-        .is_err());
+        assert!(Cli::try_parse_from(["add-rsi", "-d", "/tmp/input", "--auto", "--all",]).is_err());
     }
 
     #[test]
@@ -1427,6 +1493,41 @@ mod tests {
         assert_eq!(
             names,
             vec!["SOLUSDT-1s-2023-12.csv", "SOLUSDT-1s-2024-02.csv"]
+        );
+    }
+
+    #[test]
+    fn collect_all_input_files_recurses_and_uses_parent_dir_prefix() {
+        let test_dir = TestDir::new();
+        let btc_dir = test_dir.path.join("spot").join("BTCUSDT");
+        let eth_dir = test_dir.path.join("futures").join("linear").join("ETHUSDT");
+        fs::create_dir_all(&btc_dir).expect("create BTC directory");
+        fs::create_dir_all(&eth_dir).expect("create ETH directory");
+
+        fs::write(btc_dir.join("BTCUSDT-1s-2024-02.csv"), "").expect("write BTC CSV");
+        fs::write(btc_dir.join("ETHUSDT-1s-2024-01.csv"), "").expect("write wrong-prefix CSV");
+        fs::write(btc_dir.join("BTCUSDT-1s-2024-03.rsi.csv"), "").expect("write RSI CSV");
+        fs::write(eth_dir.join("ETHUSDT-1s-2024-01.csv"), "").expect("write ETH CSV");
+        fs::write(eth_dir.join("ETHUSDT-5m-2024-01.csv"), "").expect("write wrong interval CSV");
+
+        let files = collect_all_input_files(&test_dir.path, "1s").expect("collect all files");
+        let names = files
+            .iter()
+            .map(|file| {
+                file.path
+                    .strip_prefix(&test_dir.path)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "futures/linear/ETHUSDT/ETHUSDT-1s-2024-01.csv",
+                "spot/BTCUSDT/BTCUSDT-1s-2024-02.csv",
+            ]
         );
     }
 
@@ -1548,6 +1649,46 @@ mod tests {
     }
 
     #[test]
+    fn all_carry_resets_state_for_each_parent_directory_group() {
+        let test_dir = TestDir::new();
+        let btc_dir = test_dir.path.join("spot").join("BTCUSDT");
+        let eth_dir = test_dir.path.join("spot").join("ETHUSDT");
+        fs::create_dir_all(&btc_dir).expect("create BTC directory");
+        fs::create_dir_all(&eth_dir).expect("create ETH directory");
+        let btc = btc_dir.join("BTCUSDT-1s-2024-01.csv");
+        let eth = eth_dir.join("ETHUSDT-1s-2024-01.csv");
+
+        write_rows(&btc, &[kline_row("10", &[]), kline_row("11", &[])]);
+        write_rows(&eth, &[kline_row("20", &[]), kline_row("21", &[])]);
+
+        run(Cli {
+            dir: test_dir.path.clone(),
+            name: "BTCUSDT".to_owned(),
+            interval: "1s".to_owned(),
+            column: 12,
+            windows: vec![1],
+            fallback: "NA".to_owned(),
+            no_carry: false,
+            carry: true,
+            jobs: 5,
+            auto: false,
+            all: true,
+            overwrite: true,
+            copy: false,
+            version_flag: false,
+        })
+        .expect("run all carry mode");
+
+        let btc_rows = read_rows(&btc);
+        let eth_rows = read_rows(&eth);
+
+        assert_eq!(btc_rows[0][12], "NA");
+        assert_eq!(btc_rows[1][12], "100");
+        assert_eq!(eth_rows[0][12], "NA");
+        assert_eq!(eth_rows[1][12], "100");
+    }
+
+    #[test]
     fn auto_carry_analysis_uses_first_row_and_counts_selected_files() {
         let test_dir = TestDir::new();
         let file_path = test_dir.path.join("SOLUSDT-1s-2024-01.csv");
@@ -1585,6 +1726,7 @@ mod tests {
         let file_info = FileInfo {
             file: InputFile {
                 path: file_path,
+                group: test_dir.path.clone(),
                 year: 2024,
                 month: 1,
             },
@@ -1843,6 +1985,7 @@ mod tests {
     fn write_rows(path: &Path, rows: &[Vec<String>]) {
         let mut writer = WriterBuilder::new()
             .has_headers(false)
+            .flexible(true)
             .from_path(path)
             .expect("create CSV writer");
 
@@ -1856,6 +1999,7 @@ mod tests {
     fn read_rows(path: &Path) -> Vec<Vec<String>> {
         let mut reader = ReaderBuilder::new()
             .has_headers(false)
+            .flexible(true)
             .from_path(path)
             .expect("open CSV reader");
 
