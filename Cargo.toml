@@ -1,6 +1,6 @@
 [package]
 name = "add-rsi"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 rust-version = "1.87"
 authors = ["Tau Technologies"]

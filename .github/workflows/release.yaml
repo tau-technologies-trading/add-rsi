@@ -175,11 +175,21 @@ jobs:
               range="HEAD"
             fi
 
-            commits="$(git log --format='\`[%h %s]\`' "${range}")"
+            commits_found=false
 
-            if [ -n "${commits}" ]; then
-              printf '%s\n' "${commits}"
-            else
+            while IFS=$'\t' read -r full_hash short_hash subject; do
+              commits_found=true
+              username="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${full_hash}" --jq '.author.login // empty' 2>/dev/null || true)"
+
+              if [ -n "${username}" ]; then
+                printf '`[%s %s]` by @%s\n' "${short_hash}" "${subject}" "${username}"
+              else
+                author="$(git show -s --format='%aN' "${full_hash}")"
+                printf '`[%s %s]` by %s\n' "${short_hash}" "${subject}" "${author}"
+              fi
+            done < <(git log --format='%H%x09%h%x09%s' "${range}")
+
+            if [ "${commits_found}" = false ]; then
               printf '- No commits found.\n'
             fi
           } > release-notes.md
