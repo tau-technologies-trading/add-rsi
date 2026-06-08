@@ -175,7 +175,7 @@ jobs:
               range="HEAD"
             fi
 
-            commits="$(git log --format='- %h %s' "${range}")"
+            commits="$(git log --format='\`[%h %s]\`' "${range}")"
 
             if [ -n "${commits}" ]; then
               printf '%s\n' "${commits}"
