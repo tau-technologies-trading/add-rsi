@@ -2191,4 +2191,190 @@ mod tests {
             })
             .collect()
     }
+
+    // ── truncate_progress_name tests ─────────────────────────────────────────
+
+    #[test]
+    fn truncate_progress_name_short_name_unchanged() {
+        let name = "SOLUSDT/SOLUSDT-1s-2024-01.csv";
+        assert_eq!(name.chars().count(), 30);
+        assert_eq!(truncate_progress_name(name), name);
+    }
+
+    #[test]
+    fn truncate_progress_name_exactly_34_chars_unchanged() {
+        // At exactly MAX_LEN characters the name must be returned verbatim.
+        let name = "A".repeat(34);
+        assert_eq!(truncate_progress_name(&name), name);
+    }
+
+    #[test]
+    fn truncate_progress_name_35_chars_truncated_with_ellipsis() {
+        let name = "A".repeat(35);
+        let result = truncate_progress_name(&name);
+        // Result must be 34 chars: 33 'A's + '…'
+        assert_eq!(result.chars().count(), 34);
+        assert!(result.ends_with('…'));
+        assert_eq!(&result[..result.len() - '…'.len_utf8()], "A".repeat(33));
+    }
+
+    #[test]
+    fn truncate_progress_name_long_name_truncated() {
+        let name = "futures/linear/ETHUSDT/ETHUSDT-1s-2024-01.csv";
+        assert!(name.chars().count() > 34);
+        let result = truncate_progress_name(name);
+        assert_eq!(result.chars().count(), 34);
+        assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_progress_name_multibyte_boundary() {
+        // Ensure truncation works correctly when the name contains multibyte
+        // characters so that the char-count boundary is respected.
+        let name = "α".repeat(35); // each 'α' is 2 bytes but 1 char
+        let result = truncate_progress_name(&name);
+        assert_eq!(result.chars().count(), 34);
+        assert!(result.ends_with('…'));
+    }
+
+    // ── format_with_commas tests ─────────────────────────────────────────────
+
+    #[test]
+    fn format_with_commas_zero() {
+        assert_eq!(format_with_commas(0), "0");
+    }
+
+    #[test]
+    fn format_with_commas_three_digits() {
+        assert_eq!(format_with_commas(999), "999");
+    }
+
+    #[test]
+    fn format_with_commas_four_digits() {
+        assert_eq!(format_with_commas(1000), "1,000");
+    }
+
+    #[test]
+    fn format_with_commas_seven_digits() {
+        assert_eq!(format_with_commas(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn format_with_commas_boundary_999_999() {
+        assert_eq!(format_with_commas(999_999), "999,999");
+    }
+
+    // ── format_rsi tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn format_rsi_zero_gain_zero_loss_returns_50() {
+        assert_eq!(format_rsi(0.0, 0.0, "NA"), "50");
+    }
+
+    #[test]
+    fn format_rsi_nonzero_gain_zero_loss_returns_100() {
+        assert_eq!(format_rsi(1.0, 0.0, "NA"), "100");
+    }
+
+    #[test]
+    fn format_rsi_zero_gain_nonzero_loss_returns_0() {
+        let result = format_rsi(0.0, 1.0, "NA");
+        let value: f64 = result.parse().expect("parseable float");
+        assert!((value - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn format_rsi_equal_gain_and_loss_returns_50() {
+        let result = format_rsi(1.0, 1.0, "NA");
+        let value: f64 = result.parse().expect("parseable float");
+        assert!((value - 50.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn format_rsi_infinite_gain_returns_fallback() {
+        assert_eq!(format_rsi(f64::INFINITY, 1.0, "NA"), "NA");
+    }
+
+    #[test]
+    fn format_rsi_nan_loss_returns_fallback() {
+        assert_eq!(format_rsi(1.0, f64::NAN, "NA"), "NA");
+    }
+
+    // ── validate_windows tests ───────────────────────────────────────────────
+
+    #[test]
+    fn validate_windows_rejects_empty_slice() {
+        assert!(validate_windows(&[]).is_err());
+    }
+
+    #[test]
+    fn validate_windows_rejects_zero_window() {
+        assert!(validate_windows(&[0]).is_err());
+        assert!(validate_windows(&[14, 0]).is_err());
+    }
+
+    #[test]
+    fn validate_windows_accepts_valid_windows() {
+        assert!(validate_windows(&[14]).is_ok());
+        assert!(validate_windows(&[14, 64, 256]).is_ok());
+    }
+
+    // ── RsiState unit tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn rsi_state_first_close_returns_fallback() {
+        let mut state = RsiState::new(2);
+        assert_eq!(state.next_cell(Some(100.0), "NA"), "NA");
+    }
+
+    #[test]
+    fn rsi_state_non_finite_close_returns_fallback() {
+        let mut state = RsiState::new(2);
+        state.next_cell(Some(100.0), "NA"); // seed last_close
+        assert_eq!(state.next_cell(Some(f64::NAN), "NA"), "NA");
+        assert_eq!(state.next_cell(Some(f64::INFINITY), "NA"), "NA");
+        assert_eq!(state.next_cell(None, "NA"), "NA");
+    }
+
+    #[test]
+    fn rsi_state_window_2_pure_gains() {
+        let mut state = RsiState::new(2);
+        state.next_cell(Some(10.0), "NA"); // sets last_close, no output
+        state.next_cell(Some(11.0), "NA"); // seed_count=1 < window=2, returns fallback
+        let result = state.next_cell(Some(12.0), "NA"); // seed_count reaches 2, emits RSI
+        let value: f64 = result.parse().expect("parseable float");
+        assert_eq!(value, 100.0); // only gains, loss=0
+    }
+
+    #[test]
+    fn rsi_state_window_2_pure_losses() {
+        let mut state = RsiState::new(2);
+        state.next_cell(Some(12.0), "NA");
+        state.next_cell(Some(11.0), "NA");
+        let result = state.next_cell(Some(10.0), "NA");
+        let value: f64 = result.parse().expect("parseable float");
+        assert!((value - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rsi_state_wilder_smoothing_after_seed() {
+        // After the seed period, subsequent values use the Wilder smoothing
+        // formula: avg_gain = (prev_avg_gain * (n-1) + gain) / n
+        let mut state = RsiState::new(2);
+        // Sets last_close=10; no previous close yet → fallback
+        state.next_cell(Some(10.0), "NA");
+        // +1 gain, seed_count=1 < window=2 → fallback
+        state.next_cell(Some(11.0), "NA");
+        // +1 gain, seed_count=2 == window=2 → seed complete:
+        //   avg_gain = (1+1)/2 = 1.0, avg_loss = 0/2 = 0.0 → RSI=100
+        state.next_cell(Some(12.0), "NA");
+        // Wilder step: 12→10, change=-2, gain=0, loss=2
+        //   new_avg_gain = (1.0*(2-1) + 0) / 2 = 0.5
+        //   new_avg_loss = (0.0*(2-1) + 2) / 2 = 1.0
+        //   RS = 0.5 / 1.0 = 0.5  →  RSI = 100 - 100/1.5 ≈ 33.333…
+        let result = state.next_cell(Some(10.0), "NA");
+        let value: f64 = result.parse().expect("parseable float");
+        let expected = 100.0 - 100.0 / (1.0 + 0.5);
+        assert!((value - expected).abs() < 1e-12);
+    }
 }
