@@ -238,7 +238,12 @@ struct ProgressSlot {
 }
 
 impl ProgressUi {
-    fn new(stage: impl Into<String>, total_rows: Option<u64>, parallel_files: usize) -> Arc<Self> {
+    fn new(
+        stage: impl Into<String>,
+        total_rows: Option<u64>,
+        parallel_files: usize,
+        unit_label: &str,
+    ) -> Arc<Self> {
         let multi = MultiProgress::new();
 
         let total_bar = match total_rows {
@@ -246,7 +251,7 @@ impl ProgressUi {
             None => multi.add(ProgressBar::new_spinner()),
         };
         total_bar.set_prefix(stage.into());
-        total_bar.set_message(parallel_summary(parallel_files));
+        total_bar.set_message(summary(parallel_files, unit_label));
         total_bar.set_style(total_progress_style(total_rows.is_some()));
 
         Arc::new(Self { multi, total_bar })
@@ -450,7 +455,7 @@ fn run_with_dir_source(mut cli: Cli, dir_was_provided: bool) -> Result<()> {
         let parallel_groups = parallel_file_count(file_groups.len(), cli.jobs);
         println!(
             "\nCarryover mode: processing {} in parallel; RSI state resets for each parent-directory group.",
-            group_summary(parallel_groups)
+            summary(parallel_groups, "group")
         );
         if selection_mode == SelectionMode::Auto {
             println!("Carryover mode: skipped --auto files are not scanned.");
@@ -460,6 +465,7 @@ fn run_with_dir_source(mut cli: Cli, dir_was_provided: bool) -> Result<()> {
             "TOTAL ",
             process_total_rows.map(|row_count| row_count as u64),
             parallel_groups,
+            "folder",
         );
         let windows = cli.windows.clone();
         let fallback = cli.fallback.clone();
@@ -509,6 +515,7 @@ fn run_with_dir_source(mut cli: Cli, dir_was_provided: bool) -> Result<()> {
             "TOTAL ",
             process_total_rows.map(|row_count| row_count as u64),
             parallel_files,
+            "file",
         );
         let windows = cli.windows.clone();
         let fallback = cli.fallback.clone();
@@ -561,20 +568,16 @@ fn parallel_file_count(file_count: usize, requested_jobs: usize) -> usize {
     requested_jobs.max(1).min(file_count.max(1))
 }
 
-fn parallel_summary(parallel_files: usize) -> String {
-    if parallel_files == 1 {
-        "1 file".to_owned()
+fn summary(count: usize, unit: &str) -> String {
+    if count == 1 {
+        format!("1 {unit}")
     } else {
-        format!("{parallel_files} files")
+        format!("{count} {unit}s")
     }
 }
 
-fn group_summary(parallel_groups: usize) -> String {
-    if parallel_groups == 1 {
-        "1 group".to_owned()
-    } else {
-        format!("{parallel_groups} groups")
-    }
+fn parallel_summary(parallel_files: usize) -> String {
+    summary(parallel_files, "file")
 }
 
 fn group_file_info(file_info: Vec<FileInfo>) -> Vec<Vec<FileInfo>> {
