@@ -190,7 +190,7 @@ jobs:
             done < <(git log --format='%H%x09%h%x09%s' "${range}")
 
             if [ "${commits_found}" = false ]; then
-              printf '- No commits found.\n'
+              printf '%s\n' '- No commits found.'
             fi
           } > release-notes.md
 
