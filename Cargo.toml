@@ -2,7 +2,7 @@
 name = "add-rsi"
 version = "1.0.2"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 authors = ["Tau Technologies"]
 description = "CLI for appending Wilder RSI columns to Binance Vision CSV files"
 readme = "README.md"
