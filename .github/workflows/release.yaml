@@ -56,10 +56,30 @@ jobs:
       - name: Install Windows cross-build dependencies
         if: matrix.xwin == true
         run: |
+          set -e
           sudo apt-get update
-          sudo apt-get install -y clang lld llvm
-          cargo install --locked cargo-xwin
+          sudo apt-get install -y gnupg software-properties-common ca-certificates wget lsb-release
 
+          # Add LLVM apt repo and install Clang 19 + lld/llvm
+          wget -qO - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+          sudo add-apt-repository "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-19 main"
+          sudo apt-get update
+          sudo apt-get install -y clang-19 lld-19 llvm-19
+
+          # Prefer clang-19/clang++-19
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-19 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-19 100
+
+          # Provide a clang-cl wrapper that forwards to clang-19 in cl compatibility mode
+          sudo tee /usr/local/bin/clang-cl > /dev/null <<'EOF'
+#!/bin/sh
+exec clang-19 --driver-mode=cl "$@"
+EOF
+          sudo chmod +x /usr/local/bin/clang-cl
+          sudo ln -sf /usr/local/bin/clang-cl /usr/bin/clang-cl || true
+
+          # Install cargo-xwin
+          cargo install --locked cargo-xwin
       - name: Build Windows release binary
         if: matrix.xwin == true
         run: cargo xwin build --release --target ${{ matrix.target }}
