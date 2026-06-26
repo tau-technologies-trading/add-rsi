@@ -72,9 +72,9 @@ jobs:
 
           # Provide a clang-cl wrapper that forwards to clang-19 in cl compatibility mode
           sudo tee /usr/local/bin/clang-cl > /dev/null <<'EOF'
-#!/bin/sh
-exec clang-19 --driver-mode=cl "$@"
-EOF
+          #!/bin/sh
+          exec clang-19 --driver-mode=cl "$@"
+          EOF
           sudo chmod +x /usr/local/bin/clang-cl
           sudo ln -sf /usr/local/bin/clang-cl /usr/bin/clang-cl || true
 
