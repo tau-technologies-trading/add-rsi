@@ -14,3 +14,17 @@ The input table defaults to `klines` and must contain `open_time` and `close`. U
 Each run reads all prices in timestamp order to reconstruct the exact Wilder state. This also accounts for historical backfills and changed prices. Only RSI values that differ are updated. Each database is updated in a transaction, so a failed calculation rolls back its changes.
 
 This version works with DuckDB databases rather than CSV files. It does not import data, fill gaps, or download files.
+
+## Rust library
+
+The crate exposes `process_database` for applications that want to call RSI processing directly:
+
+```rust,ignore
+add_rsi::process_database(
+    std::path::Path::new("db/BTCUSDT.duckdb"),
+    "klines",
+    &[16, 64, 256],
+)?;
+```
+
+It returns the number of rows processed and leaves error handling to the caller.
