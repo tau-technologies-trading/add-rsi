@@ -1,114 +1,16 @@
 # add-rsi
 
-`add-rsi` is a 🌩️ fast Rust CLI that appends Wilder RSI columns to Binance Vision format CSV files.
-
-The tool reads kline-style CSV rows, preserves the configured leading columns, appends one RSI column per requested window, and writes either in place or to sibling `.rsi.csv` files.
-
-## Build
-
-```sh
-cargo build --release
-```
-
-The optimized binary is written to:
-
-```text
-target/release/add-rsi
-```
-
-## Data Layout
-
-By default, the CLI expects BTCUSDT data here:
-
-```text
-../data/BTCUSDT/
-  BTCUSDT-1s-2024-01.csv
-  BTCUSDT-1s-2024-02.csv
-```
-
-With `--all`, the default root is `../data/`. The CLI searches recursively and uses each CSV file's parent directory name as the required filename prefix:
-
-```text
-../data/spot/BTCUSDT/BTCUSDT-1s-2024-01.csv
-../data/spot/ETHUSDT/ETHUSDT-1s-2024-01.csv
-```
-
-Files such as `BTCUSDT-1s-2024-01.rsi.csv` are skipped because they do not match the input filename format.
+Calculate continuous Wilder RSI columns directly in per-ticker DuckDB kline databases. Run this after importing raw data with `csv-to-duckdb`.
 
 ## Usage
 
-Process the default BTCUSDT directory:
-
 ```sh
-add-rsi
+cargo run --release -- --db ../db/BTCUSDT/BTCUSDT.duckdb
+cargo run --release -- --db ../db/BTCUSDT/BTCUSDT.duckdb --window 14,64,256
 ```
 
-Process a specific symbol directory:
+The input table defaults to `klines` and must contain `open_time` and `close`. Use `--table` to choose another table. Windows map in order to `rsi_1`, `rsi_2`, and so on; defaults are 16, 64, and 256. Missing columns are added. RSI is NULL until enough price changes have been observed.
 
-```sh
-add-rsi -d ../data/ETHUSDT -n ETHUSDT
-```
+Each run reads all prices in timestamp order to reconstruct the exact Wilder state. This also accounts for historical backfills and changed prices. Only RSI values that differ are updated. Each database is updated in a transaction, so a failed calculation rolls back its changes.
 
-Process all matching symbol directories recursively under `../data/`:
-
-```sh
-add-rsi --all
-```
-
-Write `.rsi.csv` copies instead of overwriting inputs:
-
-```sh
-add-rsi --copy
-```
-
-Process with RSI carryover across monthly files:
-
-```sh
-add-rsi --carry
-```
-
-Process all symbol groups with carryover per group:
-
-```sh
-add-rsi --all --carry --jobs 5
-```
-
-## Important Flags
-
-```text
--d, --dir <DIR>          Directory to process
--n, --name <NAME>        File prefix in normal mode [default: BTCUSDT]
--i, --interval <INT>     Interval in filenames [default: 1s]
--c, --column <N>         Leading columns to preserve [default: 12]
--w, --window <N,...>     RSI windows [default: 16,64,256]
--f, --fallback <VALUE>   Value for unavailable RSI cells [default: empty]
---carry                  Carry RSI state across files in chronological order
---no-carry               Process each file independently
--j, --jobs <N>           Maximum parallel files or groups [default: 5]
--a, --auto               Skip files that already have requested RSI columns
---all                    Recursively process matching CSVs by parent directory
--o, --overwrite          Overwrite original files in place
--C, --copy               Write sibling .rsi.csv files
-```
-
-## Carry Behavior
-
-Without `--carry`, every file is processed independently and files run in parallel.
-
-With `--carry`, files in the same parent directory are processed in chronological order so RSI state continues across file boundaries. When `--all --carry` is used, each parent directory is processed as an independent group, and different groups run in parallel.
-
-## Safety
-
-By default, the CLI overwrites input CSV files after confirmation. Use `--copy` to keep originals unchanged.
-
-Set `ADD_RSI_NO_CONFIRM=1` to skip the confirmation prompt.
-
-## Validation
-
-Common development checks:
-
-```sh
-cargo fmt
-cargo test
-cargo clippy --all-targets --all-features
-```
+This version works with DuckDB databases rather than CSV files. It does not import data, fill gaps, or download files.

@@ -2,25 +2,23 @@
 name = "add-rsi"
 version = "1.0.3"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.90"
 authors = ["Tau Technologies"]
-description = "CLI for appending Wilder RSI columns to Binance Vision CSV files"
+description = "Calculate Wilder RSI in DuckDB kline databases"
 readme = "README.md"
 repository = "https://github.com/tau-technologies-trading/add-rsi"
 homepage = "https://github.com/tau-technologies-trading/add-rsi"
 license = "MIT"
-keywords = ["rsi", "binance", "csv", "trading", "cli"]
+keywords = ["rsi", "binance", "duckdb", "trading", "cli"]
 categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-csv = "1.3"
-rayon = "1.10"
-indicatif = "0.18"
+indicatif = "0.18.6"
 
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-strip = true
+[target.'cfg(not(windows))'.dependencies]
+duckdb = { version = "1.10504", features = ["bundled"] }
+
+[target.'cfg(windows)'.dependencies]
+duckdb = "1.10504"
