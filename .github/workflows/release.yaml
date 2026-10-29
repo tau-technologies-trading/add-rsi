@@ -88,11 +88,32 @@ jobs:
         if: matrix.xwin != true
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Copy Windows runtime library
+        if: matrix.xwin == true
+        run: |
+          mapfile -t dlls < <(find "target/${{ matrix.target }}/duckdb-download/${{ matrix.target }}" -type f -name duckdb.dll)
+          if [ "${#dlls[@]}" -ne 1 ]; then
+            echo "Expected exactly one DuckDB DLL for ${{ matrix.target }}, found ${#dlls[@]}" >&2
+            exit 1
+          fi
+          cp "${dlls[0]}" "target/${{ matrix.target }}/release/duckdb.dll"
+
       - name: Upload binary
+        if: matrix.xwin != true
         uses: actions/upload-artifact@v7.0.2
         with:
           name: add-rsi-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
+
+      - name: Upload Windows binary
+        if: matrix.xwin == true
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: add-rsi-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/${{ matrix.binary }}
+            target/${{ matrix.target }}/release/duckdb.dll
           if-no-files-found: error
 
   release:
@@ -169,13 +190,18 @@ jobs:
 
           for target in windows_targets:
               source = artifacts / f"add-rsi-{target}" / "add-rsi.exe"
+              duckdb_dll = artifacts / f"add-rsi-{target}" / "duckdb.dll"
               archive = dist / f"add-rsi-{tag}-{target}.zip"
 
               if not source.exists():
                   raise FileNotFoundError(source)
 
+              if not duckdb_dll.exists():
+                  raise FileNotFoundError(duckdb_dll)
+
               with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zip_file:
                   zip_file.write(source, arcname="add-rsi.exe")
+                  zip_file.write(duckdb_dll, arcname="duckdb.dll")
           PY
 
       - name: Generate release notes
