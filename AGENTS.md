@@ -1,23 +1,17 @@
 # AGENTS.md
 
-## Project Overview
+## Project overview
 
-`add-rsi` is a Rust CLI that appends Wilder RSI columns to Binance Vision CSV files. The main implementation lives in `src/main.rs`.
+`add-rsi` is a library crate for recalculating Wilder RSI columns in DuckDB kline databases. The public API is in `src/lib.rs`; this package has no CLI executable.
 
-## Common Commands
+## Development
 
-- `cargo fmt` formats Rust code.
-- `cargo test` runs the test suite.
-- `cargo clippy --all-targets --all-features` checks for common Rust issues.
-- `cargo build --release` builds the optimized CLI binary.
-
-## Development Notes
-
-- Keep changes small and focused; this project is currently a single-binary crate.
-- Prefer preserving existing CLI behavior unless the task explicitly requests a behavior change.
-- Update `Cargo.toml` and `Cargo.lock` versions only for user-facing releases or packaged behavior changes, not for documentation-only updates.
-- Avoid committing generated build artifacts under `target/`.
+- Keep the public API focused on RSI processing.
+- Preserve database transaction behavior and exact chronological Wilder calculations.
+- Avoid generated artifacts under `target/`.
 
 ## Validation
 
-Before committing code changes, run `cargo fmt`, `cargo test`, and `cargo clippy --all-targets --all-features` when relevant. For documentation-only changes, a git diff review is usually sufficient.
+- `cargo fmt --check`
+- `cargo build --release`
+- `cargo test` when the user asks for tests or verification

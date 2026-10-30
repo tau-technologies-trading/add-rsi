@@ -1,23 +1,16 @@
 # add-rsi
 
-Calculate continuous Wilder RSI columns directly in per-ticker DuckDB kline databases. Run this after importing raw data with `csv-to-duckdb`.
+Library for calculating continuous Wilder RSI columns in DuckDB kline tables.
 
-## Usage
+## Use
 
-```sh
-cargo run --release -- --db ../db/BTCUSDT/BTCUSDT.duckdb
-cargo run --release -- --db ../db/BTCUSDT/BTCUSDT.duckdb --window 14,64,256
+Add the crate to your Rust project:
+
+```toml
+add-rsi = "1.1.1"
 ```
 
-The input table defaults to `klines` and must contain `open_time` and `close`. Use `--table` to choose another table. Windows map in order to `rsi_1`, `rsi_2`, and so on; defaults are 16, 64, and 256. Missing columns are added. RSI is NULL until enough price changes have been observed.
-
-Each run reads all prices in timestamp order to reconstruct the exact Wilder state. This also accounts for historical backfills and changed prices. Only RSI values that differ are updated. Each database is updated in a transaction, so a failed calculation rolls back its changes.
-
-This version works with DuckDB databases rather than CSV files. It does not import data, fill gaps, or download files.
-
-## Rust library
-
-The crate exposes `process_database` for applications that want to call RSI processing directly:
+Call `process_database` with a database path, table name, and RSI windows:
 
 ```rust,ignore
 add_rsi::process_database(
@@ -27,4 +20,8 @@ add_rsi::process_database(
 )?;
 ```
 
-It returns the number of rows processed and leaves error handling to the caller.
+Windows map in order to `rsi_1`, `rsi_2`, and so on. The table must contain `open_time` as its primary key and a `close` column. Missing RSI columns are added. RSI is NULL until enough price changes have been observed.
+
+Each call reads prices in timestamp order to reconstruct the exact Wilder state, accounting for historical backfills and changed prices. Only changed RSI values are updated. Database updates run in a transaction, so a failed calculation rolls back its changes.
+
+`inspect_database` reports the latest `open_time` and whether each configured RSI column has values at its first computable row and latest row. The literal first row is part of the warm-up period and has a NULL RSI.

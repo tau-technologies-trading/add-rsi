@@ -1,28 +1,10 @@
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
 use duckdb::{Connection, appender_params_from_iter, types::ToSql};
 use indicatif::{ProgressBar, ProgressStyle};
-
-#[derive(Debug, Parser)]
-#[command(
-    version,
-    about = "Calculate continuous Wilder RSI in DuckDB kline databases"
-)]
-struct Cli {
-    /// Ticker database to update.
-    #[arg(short, long)]
-    db: PathBuf,
-    /// Table containing open_time and close columns.
-    #[arg(long, default_value = "klines")]
-    table: String,
-    /// Wilder windows, mapped in order to rsi_1, rsi_2, ... .
-    #[arg(short, long, value_delimiter = ',', num_args = 1.., default_values_t = [16_usize, 64, 256])]
-    window: Vec<usize>,
-}
 
 #[derive(Debug)]
 struct RsiState {
@@ -72,6 +54,105 @@ impl RsiState {
 
 fn ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// RSI and timestamp state inspected before or after an import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabaseStatus {
+    pub max_open_time: Option<i64>,
+    pub rsi_at_boundaries: bool,
+}
+
+/// Inspect whether every configured RSI column has values at its first
+/// computable row and at the latest row. The literal first row is a warm-up
+/// row and correctly has NULL RSI values.
+pub fn inspect_database(path: &Path, table: &str, windows: &[usize]) -> Result<DatabaseStatus> {
+    if windows.is_empty() || windows.contains(&0) {
+        bail!("RSI windows must be greater than zero");
+    }
+    if !path.is_file() {
+        return Ok(DatabaseStatus {
+            max_open_time: None,
+            rsi_at_boundaries: false,
+        });
+    }
+    let conn = Connection::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let table_name = table.to_string();
+    let quoted_table = ident(table);
+    let schema_sql = format!(
+        "SELECT name FROM pragma_table_info('{}')",
+        table_name.replace('\'', "''")
+    );
+    let mut schema = conn.prepare(&schema_sql)?;
+    let columns = schema
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<duckdb::Result<Vec<_>>>()?;
+    drop(schema);
+    if columns.is_empty() {
+        return Ok(DatabaseStatus {
+            max_open_time: None,
+            rsi_at_boundaries: false,
+        });
+    }
+    if !columns.iter().any(|name| name == "open_time") {
+        bail!("{table_name} does not contain open_time");
+    }
+
+    let max_open_time = conn.query_row(
+        &format!("SELECT MAX(open_time) FROM {quoted_table}"),
+        [],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    let row_count = conn.query_row(&format!("SELECT COUNT(*) FROM {quoted_table}"), [], |row| {
+        row.get::<_, i64>(0)
+    })? as usize;
+    let has_rsi_columns =
+        (1..=windows.len()).all(|index| columns.iter().any(|name| name == &format!("rsi_{index}")));
+    if !has_rsi_columns || row_count == 0 {
+        return Ok(DatabaseStatus {
+            max_open_time,
+            rsi_at_boundaries: false,
+        });
+    }
+
+    let mut first_ready = true;
+    for (index, window) in windows.iter().enumerate() {
+        if row_count <= *window {
+            first_ready = false;
+            break;
+        }
+        let value = conn.query_row(
+            &format!(
+                "SELECT rsi_{} FROM {quoted_table} ORDER BY open_time LIMIT 1 OFFSET {window}",
+                index + 1
+            ),
+            [],
+            |row| row.get::<_, Option<f64>>(0),
+        )?;
+        if value.is_none() {
+            first_ready = false;
+            break;
+        }
+    }
+
+    let last_columns = (1..=windows.len())
+        .map(|index| format!("rsi_{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let last_values = conn.query_row(
+        &format!("SELECT {last_columns} FROM {quoted_table} ORDER BY open_time DESC LIMIT 1"),
+        [],
+        |row| {
+            (0..windows.len())
+                .map(|index| row.get::<_, Option<f64>>(index))
+                .collect::<duckdb::Result<Vec<_>>>()
+        },
+    )?;
+
+    Ok(DatabaseStatus {
+        max_open_time,
+        rsi_at_boundaries: first_ready && last_values.iter().all(Option::is_some),
+    })
 }
 
 /// Recalculate Wilder RSI columns in a DuckDB table.
@@ -224,28 +305,11 @@ pub fn process_database(path: &Path, table: &str, windows: &[usize]) -> Result<u
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
-    if cli.window.is_empty() || cli.window.contains(&0) {
-        bail!("RSI windows must be greater than zero");
-    }
-    if cli.table.is_empty() {
-        bail!("table name must not be empty");
-    }
-    let count = process_database(&cli.db, &cli.table, &cli.window)
-        .with_context(|| format!("failed to update {}", cli.db.display()))?;
-    println!("{}: processed {count} rows", cli.db.display());
-    Ok(())
-}
-
-/// Run the `add-rsi` command-line interface.
-pub fn run_cli() -> Result<()> {
-    run(Cli::parse())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     #[test]
     fn wilder_seed_and_smoothing() {
         let mut rsi = RsiState::new(2);
