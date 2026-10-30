@@ -7,7 +7,7 @@ Library for calculating continuous Wilder RSI columns in DuckDB kline tables.
 Add the crate to your Rust project:
 
 ```toml
-add-rsi = "1.1.1"
+add-rsi = "1.1.2"
 ```
 
 Call `process_database` with a database path, table name, and RSI windows:
